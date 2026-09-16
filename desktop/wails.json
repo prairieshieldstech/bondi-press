@@ -1,0 +1,19 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "bondi-press",
+  "outputfilename": "Bondi Press",
+  "frontend:install": "npm install",
+  "frontend:build": "npm run build",
+  "frontend:dev:watcher": "npm run dev",
+  "frontend:dev:serverUrl": "auto",
+  "author": {
+    "name": "yanga",
+    "email": "hmango77@gmail.com"
+  },
+  "info": {
+    "productName": "Bondi Press",
+    "productVersion": "1.0.0",
+    "description": "Convert Microsoft Publisher (.pub) files without Publisher — PDF, DOCX, images and more.",
+    "copyright": "Bondi Digital"
+  }
+}

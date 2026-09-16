@@ -1,0 +1,376 @@
+---
+import Layout from "@/layouts/Layout.astro";
+import { site } from "@/lib/site";
+
+const stats = [
+  { value: "11", label: "output formats" },
+  { value: "3", label: "files to convert a batch" },
+  { value: "0", label: "installations, servers, or subscriptions" },
+];
+
+const screenshots = [
+  {
+    src: "/publisher-initial-screen.png",
+    alt: "Bondi Press initial screen with dropzone",
+    caption: "Drop .pub files straight into the widget",
+  },
+  {
+    src: "/drop-highlighted.png",
+    alt: "Dropzone highlighted while dragging files",
+    caption: "Drag & drop one file or a whole batch",
+  },
+  {
+    src: "/one-file-loaded.png",
+    alt: "One file loaded into Bondi Press",
+    caption: "Files queue up with one tap of “Add more”",
+  },
+  {
+    src: "/two-files-loaded.png",
+    alt: "Two files loaded into Bondi Press",
+    caption: "Convert many files in a single run",
+  },
+  {
+    src: "/choose-format.png",
+    alt: "Choosing an output format in Bondi Press",
+    caption: "Pick your output — PDF, DOCX, images and more",
+  },
+  {
+    src: "/successfull-conversion.png",
+    alt: "Successful conversion results in Bondi Press",
+    caption: "Done — export lands in your Downloads folder",
+  },
+];
+
+const formats = ["PDF", "DOCX", "DOC", "ODT", "RTF", "TXT", "PNG", "JPG", "SVG", "HTML", "ODG"];
+
+const stack = [
+  { name: "Go", role: "Conversion engine & desktop runtime", via: "os/exec · Wails bindings" },
+  { name: "LibreOffice", role: "Publisher importer (.pub → PDF)", via: "headless draw filter" },
+  { name: "Wails v2", role: "Native windowing & UI bridge", via: "frameless singleton widget" },
+  { name: "Astro", role: "This marketing site & browser tool", via: "islands · React" },
+  { name: "pdf2docx", role: "PDF → editable Word document", via: "layout-preserving converter" },
+];
+---
+
+<Layout title={site.name} path="/">
+  <!-- ---------- Hero ---------- -->
+  <header
+    class="relative overflow-hidden"
+    style="background: radial-gradient(120% 75% at 50% -8%, #ffffff 0%, #f6f5f2 55%, #efece5 100%);"
+  >
+    <nav class="mx-auto flex max-w-6xl items-center justify-between px-6 py-5 sm:px-8">
+      <div class="flex items-center gap-2.5">
+        <img src="/images/logo.svg" alt="" width="28" height="28" class="h-7 w-7" />
+        <span class="font-display text-lg font-semibold tracking-tight text-ink">
+          {site.shortName}
+        </span>
+      </div>
+      <div class="hidden items-center gap-8 text-sm font-medium text-ink-soft sm:flex">
+        <a href="#product" class="transition-colors hover:text-ink">Product</a>
+        <a href="#formats" class="transition-colors hover:text-ink">Formats</a>
+        <a href="#how" class="transition-colors hover:text-ink">How it works</a>
+        <a href="#stack" class="transition-colors hover:text-ink">Built with</a>
+      </div>
+      <a
+        href="#download"
+        class="rounded-full border border-ink/15 bg-white/70 px-4 py-1.5 text-sm font-semibold text-ink backdrop-blur transition-colors hover:bg-white"
+      >
+        Download
+      </a>
+    </nav>
+    <section data-hero class="mx-auto max-w-6xl px-6 pt-16 pb-24 sm:px-8 sm:pt-24 sm:pb-32">
+      <div class="grid items-center gap-16 lg:grid-cols-[1.1fr_0.9fr]">
+        <div>
+          <p
+            class="inline-flex items-center gap-2 rounded-full border border-ink/10 bg-white/70 px-3.5 py-1.5 text-[13px] font-semibold text-ink shadow-sm backdrop-blur"
+          >
+            <span class="h-1.5 w-1.5 rounded-full bg-[#1f9d55]" />
+            Microsoft Publisher retires Oct 1, 2026
+          </p>
+          <h1
+            class="mt-6 font-display text-[2.75rem] font-bold leading-[1.05] tracking-tight text-ink sm:text-6xl lg:text-[4.25rem]"
+          >
+            Your .pub archive
+            <br />
+            doesn't retire with it.
+          </h1>
+          <p class="mt-6 max-w-xl text-lg leading-relaxed text-ink-soft sm:text-xl">
+            Bondi Press opens every Publisher file you've ever made — Publisher 98
+            through today — and converts it to <span class="font-semibold text-ink">PDF,
+            Word, or images</span>. Free desktop app. Nothing to install, nothing to host,
+            nothing to pay for.
+          </p>
+          <div class="mt-9 flex flex-col gap-3 sm:flex-row">
+            <a
+              href="#download"
+              class="group inline-flex items-center justify-center gap-2.5 rounded-full bg-ink px-7 py-3.5 text-base font-semibold text-[#f6f5f2] shadow-[0_18px_40px_-14px_rgba(22,24,29,0.5)] transition-all hover:-translate-y-0.5 hover:bg-ink-soft"
+            >
+              Download Bondi Press
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="h-4 w-4 transition-transform group-hover:translate-y-0.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+            </a>
+            
+          </div>
+          <dl class="mt-12 grid max-w-xl grid-cols-3 gap-6 border-t border-ink/10 pt-8">
+            {stats.map((s) => (
+              <div>
+                <dt class="sr-only">{s.label}</dt>
+                <dd class="font-display text-3xl font-bold text-ink">{s.value}</dd>
+                <dd class="mt-1 text-[13px] leading-snug text-ink-faint">{s.label}</dd>
+              </div>
+            ))}
+          </dl>
+        </div>
+
+        <div class="relative hidden lg:block">
+          <div
+            class="absolute -inset-8 rounded-[3rem]"
+            style="background: radial-gradient(60% 60% at 50% 30%, rgba(255,255,255,0.9), rgba(255,255,255,0) 70%);"
+          />
+          <div class="relative overflow-hidden rounded-2xl border border-ink/10 shadow-[0_40px_90px_-30px_rgba(22,24,29,0.4)]">
+            <img
+              src="/publisher-initial-screen.png"
+              alt="Bondi Press widget"
+              class="w-full"
+            />
+          </div>
+          <div
+            class="absolute -bottom-8 -left-10 hidden w-52 rotate-[-4deg] overflow-hidden rounded-xl border border-ink/10 bg-white shadow-[0_30px_60px_-20px_rgba(22,24,29,0.4)] xl:block"
+          >
+            <img src="/successfull-conversion.png" alt="Bondi Press conversion done" class="w-full" />
+          </div>
+        </div>
+      </div>
+    </section>
+  </header>
+
+  <main>
+    <!-- ---------- Format strip ---------- -->
+    <section class="border-y border-ink/10 bg-white/60">
+      <div class="mx-auto flex max-w-6xl flex-wrap items-center justify-center gap-x-9 gap-y-3 px-6 py-6 text-sm font-semibold text-ink-faint sm:px-8">
+        <span class="uppercase tracking-wider text-ink/40">Converts to</span>
+        {formats.map((f) => (
+          <span class="text-ink">{f}</span>
+        ))}
+      </div>
+    </section>
+
+    <!-- ---------- Product / screenshots ---------- -->
+    <section id="product" class="mx-auto max-w-6xl px-6 py-24 sm:px-8 sm:py-32">
+      <div class="mx-auto max-w-2xl text-center">
+        <p class="text-[13px] font-semibold uppercase tracking-[0.2em] text-ink-faint">
+          The product
+        </p>
+        <h2 class="mt-3 font-display text-3xl font-bold tracking-tight text-ink sm:text-[2.75rem]">
+          A tiny widget. A serious engine.
+        </h2>
+        <p class="mt-5 text-lg leading-relaxed text-ink-soft">
+          Bondi Press keeps out of your way — a fast, frameless utility that lives on
+          your desktop and converts your whole archive in seconds.
+        </p>
+      </div>
+
+      <div data-gsap="stagger" class="mt-16 grid grid-cols-2 gap-5 sm:grid-cols-3">
+        {screenshots.map((s) => (
+          <figure
+            class="overflow-hidden rounded-2xl border border-ink/10 bg-white shadow-[0_20px_50px_-25px_rgba(22,24,29,0.3)] transition-shadow hover:shadow-[0_28px_60px_-24px_rgba(22,24,29,0.38)]"
+          >
+            <div class="border-b border-ink/5 bg-[#faf9f6] p-3">
+              <img src={s.src} alt={s.alt} loading="lazy" class="w-full rounded-lg" />
+            </div>
+            <figcaption class="px-4 py-3.5 text-[13px] font-medium text-ink-soft">
+              {s.caption}
+            </figcaption>
+          </figure>
+        ))}
+      </div>
+    </section>
+
+    <!-- ---------- Formats deep-dive ---------- -->
+    <section id="formats" class="border-y border-ink/10" style="background: #f1eee7;">
+      <div class="mx-auto max-w-6xl px-6 py-24 sm:px-8 sm:py-32">
+        <div class="grid gap-16 lg:grid-cols-2 lg:items-center">
+          <div>
+            <p class="text-[13px] font-semibold uppercase tracking-[0.2em] text-ink-faint">
+              Output formats
+            </p>
+            <h2 class="mt-3 font-display text-3xl font-bold tracking-tight text-ink sm:text-[2.5rem]">
+              Whatever you need to keep the work going
+            </h2>
+            <p class="mt-5 max-w-lg text-lg leading-relaxed text-ink-soft">
+              Keep documents editable, archive them as PDF, or ship them as images for
+              the web. One file in, whichever file you need out.
+            </p>
+            <ul class="mt-8 space-y-4">
+              {[
+                { t: "Fixed layout", d: "PDF — pixel-perfect print and archive output." },
+                { t: "Editable text", d: "DOCX, DOC, ODT, RTF, TXT — keep updating, keep collaborating." },
+                { t: "Raster & vector", d: "PNG, JPG, SVG, HTML, ODG — for the web, signage and design." },
+              ].map((row) => (
+                <li class="flex gap-4">
+                  <span class="mt-2 h-2 w-2 shrink-0 rounded-full bg-ink" />
+                  <div>
+                    <p class="font-semibold text-ink">{row.t}</p>
+                    <p class="text-sm text-ink-faint">{row.d}</p>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          </div>
+          <div data-gsap="stagger" class="grid grid-cols-2 gap-4">
+            {formats.map((f, i) => (
+              <div
+                class="flex items-center justify-between rounded-xl border border-ink/10 bg-white px-5 py-4 shadow-sm"
+              >
+                <span class="font-display text-base font-semibold text-ink">{f}</span>
+                <span class="text-xs font-semibold uppercase tracking-wider text-ink/30">
+                  {["Fixed", "Editable", "Editable", "Editable", "Editable", "Text", "Raster", "Raster", "Vector", "Web", "Vector"][i]}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ---------- How it works ---------- -->
+    <section id="how" class="mx-auto max-w-6xl px-6 py-24 sm:px-8 sm:py-32">
+      <div class="mx-auto max-w-2xl text-center">
+        <p class="text-[13px] font-semibold uppercase tracking-[0.2em] text-ink-faint">
+          How it works
+        </p>
+        <h2 class="mt-3 font-display text-3xl font-bold tracking-tight text-ink sm:text-[2.75rem]">
+          Three taps. Your whole archive, saved.
+        </h2>
+      </div>
+      <div data-gsap="stagger" class="mt-16 grid gap-6 sm:grid-cols-3">
+        {[
+          {
+            n: "01",
+            t: "Drop in your files",
+            d: "Drag a single .pub or a whole folderful onto the widget.",
+          },
+          {
+            n: "02",
+            t: "Choose the format",
+            d: "PDF for archiving, DOCX to keep editing, images for the web.",
+          },
+          {
+            n: "03",
+            t: "Convert the batch",
+            d: "Everything lands, organised, in your Downloads folder.",
+          },
+        ].map((step) => (
+          <div class="rounded-2xl border border-ink/10 bg-white p-7 shadow-sm">
+            <p class="font-display text-sm font-bold tracking-[0.2em] text-ink/30">
+              {step.n}
+            </p>
+            <h3 class="mt-3 font-display text-xl font-bold tracking-tight text-ink">
+              {step.t}
+            </h3>
+            <p class="mt-2.5 text-sm leading-relaxed text-ink-soft">{step.d}</p>
+          </div>
+        ))}
+      </div>
+    </section>
+
+    <!-- ---------- Built with / tech stack ---------- -->
+    <section id="stack" class="border-t border-ink/10" style="background: #f1eee7;">
+      <div class="mx-auto max-w-6xl px-6 py-20 sm:px-8 sm:py-24">
+        <div class="flex flex-col gap-10 lg:flex-row lg:items-start">
+          <div class="lg:max-w-xs">
+            <p class="text-[13px] font-semibold uppercase tracking-[0.2em] text-ink-faint">
+              Built with
+            </p>
+            <h2 class="mt-3 font-display text-2xl font-bold tracking-tight text-ink sm:text-3xl">
+              Serious tools, used properly
+            </h2>
+            <p class="mt-4 text-sm leading-relaxed text-ink-soft">
+              Bondi Press is open about its stack — a small, reliable core doing one
+              thing well.
+            </p>
+          </div>
+          <ul class="grid flex-1 gap-4 sm:grid-cols-2">
+            {stack.map((item) => (
+              <li class="rounded-xl border border-ink/10 bg-white px-6 py-5">
+                <p class="font-display text-base font-bold text-ink">{item.name}</p>
+                <p class="mt-1 text-sm text-ink-soft">{item.role}</p>
+                <p class="mt-2 text-xs font-medium uppercase tracking-wider text-ink/35">
+                  {item.via}
+                </p>
+              </li>
+            ))}
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <!-- ---------- Download ---------- -->
+    <section id="download" class="relative overflow-hidden" style="background: radial-gradient(120% 80% at 50% 0%, #ffffff 0%, #f6f5f2 55%, #efece5 100%);">
+      <div class="mx-auto max-w-4xl px-6 py-24 text-center sm:px-8 sm:py-32">
+        <p class="text-[13px] font-semibold uppercase tracking-[0.2em] text-ink-faint">
+          Get Bondi Press
+        </p>
+        <h2 class="mt-3 font-display text-3xl font-bold tracking-tight text-ink sm:text-[2.75rem]">
+          Free. No Publisher. No subscription.
+        </h2>
+        <p class="mx-auto mt-5 max-w-xl text-lg leading-relaxed text-ink-soft">
+          A self-contained app for your platform — the engine travels with it.
+        </p>
+        <div class="mt-12 grid gap-5 sm:grid-cols-3">
+          <a
+            href="#download"
+            class="group rounded-2xl border border-ink/10 bg-white p-7 text-left shadow-[0_20px_50px_-25px_rgba(22,24,29,0.35)] transition-all hover:-translate-y-1"
+          >
+            <p class="font-display text-lg font-bold text-ink">macOS</p>
+            <p class="mt-1 text-sm text-ink-faint">Apple Silicon</p>
+            <p class="mt-6 inline-flex items-center gap-2 text-sm font-semibold text-ink">
+              Download .dmg
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="h-4 w-4 transition-transform group-hover:translate-x-0.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+            </p>
+          </a>
+          <div class="rounded-2xl border border-ink/10 bg-white/70 p-7 text-left opacity-70">
+            <p class="font-display text-lg font-bold text-ink">Windows</p>
+            <p class="mt-1 text-sm text-ink-faint">10 &amp; 11, 64-bit</p>
+            <p class="mt-6 text-sm font-semibold text-ink/40">Coming soon</p>
+          </div>
+          <div class="rounded-2xl border border-ink/10 bg-white/70 p-7 text-left opacity-70">
+            <p class="font-display text-lg font-bold text-ink">Linux</p>
+            <p class="mt-1 text-sm text-ink-faint">AppImage</p>
+            <p class="mt-6 text-sm font-semibold text-ink/40">Coming soon</p>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- ---------- Footer ---------- -->
+  <footer class="border-t border-ink/10 bg-[#faf9f6]">
+    <div class="mx-auto max-w-6xl px-6 py-10 sm:px-8">
+      <div class="flex flex-col items-center justify-between gap-4 sm:flex-row">
+        <div class="flex items-center gap-2.5">
+          <img src="/images/logo.svg" alt="" width="22" height="22" class="h-5 w-5 opacity-90" />
+          <span class="font-display text-sm font-semibold text-ink">{site.shortName}</span>
+        </div>
+        <p class="text-center text-xs text-ink-faint">
+          Conversion happens on your machine — your files are never stored or shared.
+        </p>
+      </div>
+      <p class="mt-6 border-t border-ink/10 pt-6 text-center text-[11px] leading-relaxed text-ink/40">
+        {site.name} · Free tool for converting .pub files · Microsoft and Publisher are
+        trademarks of Microsoft Corporation. Not affiliated with Microsoft. Wails is a
+        trademark of its respective owners.
+      </p>
+      <p class="mt-3 text-center text-[11px] text-ink/40">
+        Built and maintained by{" "}
+        <a
+          href="https://www.prairieshieldstech.com/"
+          target="_blank"
+          rel="noopener"
+          class="font-semibold text-ink-soft underline underline-offset-2 transition-colors hover:text-ink"
+        >
+          Prairie Shield Technologies
+        </a>
+      </p>
+    </div>
+  </footer>
+</Layout>

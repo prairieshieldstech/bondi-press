@@ -1,0 +1,105 @@
+---
+import "@/styles/global.css";
+import Seo from "@/components/Seo.astro";
+import { site } from "@/lib/site";
+
+interface Props {
+  title: string;
+  description?: string;
+  path?: string;
+}
+
+const {
+  title,
+  description = site.description,
+  path,
+} = Astro.props;
+const pathname = Astro.url.pathname;
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link
+      rel="preload"
+      href="/fonts/space-grotesk-latin.woff2"
+      as="font"
+      type="font/woff2"
+      crossorigin
+    />
+    <link
+      rel="preload"
+      href="/fonts/outfit-latin.woff2"
+      as="font"
+      type="font/woff2"
+      crossorigin
+    />
+    <meta name="theme-color" content="#f1f5f9" />
+    <Seo title={title} description={description} path={path} />
+    <script is:inline>
+      document.documentElement.classList.add("js");
+      setTimeout(function () {
+        document.querySelectorAll(".reveal").forEach(function (el) {
+          el.classList.add("in");
+        });
+      }, 1800);
+    </script>
+  </head>
+  <body>
+    <a
+      href="#main"
+      class="sr-only focus:not-sr-only focus:fixed focus:left-4 focus:top-4 focus:z-[100] focus:rounded-md focus:bg-accent-light focus:px-4 focus:py-2 focus:text-sm focus:font-semibold focus:text-accent focus:shadow-lg"
+    >
+      Skip to content
+    </a>
+
+    <main id="main">
+      <slot />
+    </main>
+
+    <script>
+      import "@/scripts/reveal.ts";
+    </script>
+    <script is:inline>
+      // GSAP light entrance animations — loads once, harmless if CDN unavailable.
+      (function () {
+        var HREF = "https://cdn.jsdelivr.net/npm/gsap@3.13.0/dist/gsap.min.js";
+        document.addEventListener("DOMContentLoaded", function () {
+          var s = document.createElement("script");
+          s.src = HREF;
+          s.async = true;
+          s.onload = function () {
+            if (!window.gsap) return;
+            var hero = document.querySelector("[data-hero]");
+            if (hero) {
+              window.gsap.from(hero.children, {
+                opacity: 0,
+                y: 22,
+                stagger: 0.12,
+                duration: 0.8,
+                ease: "power3.out",
+              });
+            }
+            var stagger = document.querySelectorAll("[data-gsap='stagger']");
+            gsapFromEach(stagger);
+            function gsapFromEach(groups) {
+              groups.forEach(function (group) {
+                window.gsap.from(group.children, {
+                  opacity: 0,
+                  y: 24,
+                  stagger: 0.1,
+                  duration: 0.7,
+                  ease: "power3.out",
+                });
+              });
+            }
+          };
+          document.body.appendChild(s);
+        });
+      })();
+    </script>
+  </body>
+</html>

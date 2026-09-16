@@ -1,0 +1,55 @@
+---
+import { site } from "@/lib/site";
+
+interface Props {
+  title: string;
+  description: string;
+  /** Path only, e.g. "/about" */
+  path?: string;
+  image?: string;
+  type?: "website" | "article";
+  noindex?: boolean;
+}
+
+const {
+  title,
+  description,
+  path = "",
+  image = site.ogImage,
+  type = "website",
+  noindex = false,
+} = Astro.props;
+
+const canonical = new URL(path || Astro.url.pathname, Astro.site ?? Astro.url).href;
+const ogImage = new URL(image, Astro.site ?? Astro.url).href;
+const fullTitle =
+  title === site.name ? title : `${title} · ${site.name}`;
+
+const orgLd = {
+  "@context": "https://schema.org",
+  "@type": "Organization",
+  name: site.name,
+  url: site.url,
+  description: site.description,
+  logo: new URL(site.logo, Astro.site ?? Astro.url).href,
+};
+---
+
+<title>{fullTitle}</title>
+<meta name="description" content={description} />
+<link rel="canonical" href={canonical} />
+{noindex && <meta name="robots" content="noindex, nofollow" />}
+
+<meta property="og:site_name" content={site.name} />
+<meta property="og:type" content={type} />
+<meta property="og:title" content={fullTitle} />
+<meta property="og:description" content={description} />
+<meta property="og:url" content={canonical} />
+<meta property="og:image" content={ogImage} />
+
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:title" content={fullTitle} />
+<meta name="twitter:description" content={description} />
+<meta name="twitter:image" content={ogImage} />
+
+<script is:inline type="application/ld+json" set:html={JSON.stringify(orgLd)} />
