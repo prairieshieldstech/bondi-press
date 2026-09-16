@@ -1,0 +1,106 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            platform: darwin/universal
+            artifact: bondi-press-macOS
+            ext: .app
+          - os: windows-latest
+            platform: windows/amd64
+            artifact: bondi-press-Windows
+            ext: .exe
+          - os: ubuntu-22.04
+            platform: linux/amd64
+            artifact: bondi-press-Linux
+            ext: ""
+
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: desktop
+
+    steps:
+      # ── checkout ──────────────────────────────────────────────────────────
+      - uses: actions/checkout@v4
+
+      # ── toolchain ─────────────────────────────────────────────────────────
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache-dependency-path: desktop/go.sum
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Wails
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
+
+      # ── linux deps ────────────────────────────────────────────────────────
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.0-dev
+
+      # ── build ─────────────────────────────────────────────────────────────
+      - name: Build app
+        run: wails build -platform ${{ matrix.platform }} -trimpath
+
+      # ── package (linux tar, mac zip, windows zip) ─────────────────────────
+      - name: Package — macOS
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          cd build/bin
+          zip -r -y ../../../${{ matrix.artifact }}.zip bondi-press.app
+
+      - name: Package — Windows
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          cd build/bin
+          7z a -tzip ../../../${{ matrix.artifact }}.zip bondi-press.exe
+
+      - name: Package — Linux
+        if: runner.os == 'Linux'
+        run: |
+          cd build/bin
+          tar czf ../../../${{ matrix.artifact }}.tar.gz bondi-press
+
+      # ── upload artifact (always; release step picks these up) ──────────────
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}*
+
+  # ── create github release from tags ─────────────────────────────────────────
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            bondi-press-macOS/*
+            bondi-press-Windows/*
+            bondi-press-Linux/*
