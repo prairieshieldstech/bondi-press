@@ -3,19 +3,33 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"fmt"
+	"html"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	goruntime "runtime"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
 type App struct {
-	ctx     context.Context
-	logoSVG []byte
+	ctx       context.Context
+	logoSVG   []byte
+	previewDir string
+	renderDir  string
+
+	previewMu    sync.Mutex
+	previewSrv   *http.Server
+	previewSrvLn net.Listener
+	previewPort  int
 }
 
 func NewApp() *App {
@@ -24,6 +38,32 @@ func NewApp() *App {
 
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
+	// Pre-warm LibreOffice's profile + font cache in the background so the
+	// first real conversion isn't stuck waiting ~40s on one-time init.
+	go func() {
+		if p, err := resolveSoffice(); err == nil {
+			cmd := exec.Command(p, "--headless", "--norestore", "--nologo", "--terminate_after_init")
+			cmd.Run()
+		}
+	}()
+}
+
+// ToggleFullscreen switches the window between its compact default size and
+// maximised, returning the resulting state. The preview/editor screens use
+// CSS vw/vh sizing that grows and shrinks with the actual window size, so
+// maximising gives a materially bigger, clearer view.
+//
+// Uses WindowMaximise/Unmaximise (a bounds change) rather than native
+// WindowFullscreen: this window is Frameless + AlwaysOnTop, and macOS's real
+// fullscreen space transition does not engage for that window style — it
+// silently no-ops. Maximise works regardless since it's just geometry.
+func (a *App) ToggleFullscreen() bool {
+	if runtime.WindowIsMaximised(a.ctx) {
+		runtime.WindowUnmaximise(a.ctx)
+		return false
+	}
+	runtime.WindowMaximise(a.ctx)
+	return true
 }
 
 // GetLogo returns the Bondi Press SVG logo for the about/dialog views.
@@ -32,6 +72,707 @@ func (a *App) GetLogo() string {
 		return ""
 	}
 	return string(a.logoSVG)
+}
+
+// PreparePreview writes edited content to a temp preview file, copies any
+// adjacent asset folders, and serves the folder over a loopback HTTP server.
+// WKWebView blocks file:// URLs inside the app, so we use http://127.0.0.1.
+// Returns an http URL the webview iframe can load.
+func (a *App) PreparePreview(originalPath, content string) (string, error) {
+	ext := strings.ToLower(filepath.Ext(originalPath))
+	if ext != ".html" && ext != ".txt" && ext != ".svg" {
+		return "", fmt.Errorf("preview only supports HTML, TXT and SVG")
+	}
+	a.CleanupPreview()
+
+	tmpDir, err := os.MkdirTemp("", "bondi-preview-*")
+	if err != nil {
+		return "", err
+	}
+	a.previewDir = tmpDir
+
+	baseName := filepath.Base(originalPath)
+	previewFile := filepath.Join(tmpDir, baseName)
+	if err := os.WriteFile(previewFile, []byte(content), 0o644); err != nil {
+		os.RemoveAll(tmpDir)
+		a.previewDir = ""
+		return "", err
+	}
+
+	if ext == ".html" {
+		srcDir := filepath.Dir(originalPath)
+		assetDir := strings.TrimSuffix(baseName, ext) + "_files"
+		srcAssets := filepath.Join(srcDir, assetDir)
+		// Copy the adjacent asset folder next to the temp file so relative
+		// image / CSS / font paths in the HTML resolve when previewed.
+		if info, err := os.Stat(srcAssets); err == nil && info.IsDir() {
+			dstAssets := filepath.Join(tmpDir, assetDir)
+			copyDir(srcAssets, dstAssets)
+		}
+	}
+
+	if err := a.servePreviewDir(tmpDir); err != nil {
+		os.RemoveAll(tmpDir)
+		a.previewDir = ""
+		return "", err
+	}
+
+	mux := http.NewServeMux()
+	mux.Handle("/", http.FileServer(http.Dir(tmpDir)))
+	a.previewSrv.Handler = mux
+
+	return fmt.Sprintf("http://127.0.0.1:%d/%s", a.previewPort, baseName), nil
+}
+
+// servePreviewDir starts (once) a loopback HTTP server rooted at dir.
+func (a *App) servePreviewDir(dir string) error {
+	a.previewMu.Lock()
+	defer a.previewMu.Unlock()
+	if a.previewSrv == nil {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			return err
+		}
+		a.previewSrv = &http.Server{}
+		a.previewSrvLn = ln
+		a.previewPort = ln.Addr().(*net.TCPAddr).Port
+		go a.previewSrv.Serve(ln)
+	}
+	mux := http.NewServeMux()
+	mux.Handle("/", http.FileServer(http.Dir(dir)))
+	a.previewSrv.Handler = mux
+	return nil
+}
+
+// CleanupPreview immediately replaces the handler so the served dir is blocked
+// and removes the temporary preview directory. The loopback server is kept
+// alive but serves 404 until the next preview.
+func (a *App) CleanupPreview() {
+	a.previewMu.Lock()
+	if a.previewSrv != nil {
+		mux := http.NewServeMux()
+		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			http.NotFound(w, r)
+		})
+		a.previewSrv.Handler = mux
+	}
+	a.previewMu.Unlock()
+
+	if a.previewDir != "" {
+		os.RemoveAll(a.previewDir)
+		a.previewDir = ""
+	}
+}
+
+// renderPdfPagesToPNGs rasterizes every page of pdfPath via PyMuPDF into PNG
+// files inside a fresh temp directory, returned as absolute paths IN PAGE
+// ORDER (page order comes from the script's own stdout, not a directory
+// listing — os.ReadDir sorts lexically, which puts "page-10.png" before
+// "page-2.png" once a document passes 9 pages). Caller owns cleanup of dir.
+func renderPdfPagesToPNGs(pdfPath string, targetW int) (dir string, files []string, err error) {
+	py, err := findPythonWithPdf2docx()
+	if err != nil {
+		return "", nil, err
+	}
+
+	tmpDir, err := os.MkdirTemp("", "bondi-pdfimg-*")
+	if err != nil {
+		return "", nil, err
+	}
+
+	script := `
+import sys, os, warnings
+warnings.filterwarnings("ignore")
+import fitz
+doc = fitz.open(sys.argv[1])
+out = sys.argv[2]
+target = float(sys.argv[3])
+for i, page in enumerate(doc):
+    r = page.rect
+    scale = target / r.width if target > 0 else 1.5
+    mat = fitz.Matrix(scale, scale)
+    pix = page.get_pixmap(matrix=mat, alpha=False)
+    fname = f"page-{i+1}.png"
+    pix.save(os.path.join(out, fname))
+    print(fname)
+`
+	ctx, cancel := context.WithTimeout(context.Background(), sofficeTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, py, "-c", script, pdfPath, tmpDir, fmt.Sprintf("%d", targetW))
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		os.RemoveAll(tmpDir)
+		return "", nil, fmt.Errorf("render pdf: %s", strings.TrimSpace(stderr.String()))
+	}
+	// PyMuPDF prints its own "fitz API deprecated" notice straight to stdout
+	// on import (not gated by warnings.filterwarnings, not on stderr), ahead
+	// of our page filenames — filter to the exact pattern we print so that
+	// noise never gets mistaken for a page file.
+	pageLine := regexp.MustCompile(`^page-\d+\.png$`)
+	for _, line := range strings.Split(strings.TrimSpace(stdout.String()), "\n") {
+		line = strings.TrimSpace(line)
+		if !pageLine.MatchString(line) {
+			continue
+		}
+		files = append(files, filepath.Join(tmpDir, line))
+	}
+	return tmpDir, files, nil
+}
+
+// RenderPdfToImages rasterizes every page of a PDF into PNGs, serves them
+// over the loopback HTTP server, and returns the list of page image URLs
+// (page order preserved). This preserves full fidelity (fonts, images,
+// styling, positioning) without relying on a PDF.js web worker, which
+// WKWebView blocks inside the app.
+func (a *App) RenderPdfToImages(pdfPath string, targetW int) ([]string, error) {
+	tmpDir, files, err := renderPdfPagesToPNGs(pdfPath, targetW)
+	if err != nil {
+		return nil, err
+	}
+
+	// servePreviewDir lazily creates the loopback server if this is the first
+	// preview of the session (e.g. opening the PDF editor directly, without
+	// ever having opened an HTML/TXT editor first — a.previewSrv is nil then).
+	if err := a.servePreviewDir(tmpDir); err != nil {
+		os.RemoveAll(tmpDir)
+		return nil, err
+	}
+	a.renderDir = tmpDir
+
+	urls := make([]string, len(files))
+	for i, f := range files {
+		urls[i] = fmt.Sprintf("http://127.0.0.1:%d/%s", a.previewPort, filepath.Base(f))
+	}
+	return urls, nil
+}
+
+// generateFaithfulHTML builds a self-contained HTML document by rasterizing
+// the ORIGINAL .pub's pages (the same pub->pdf->PyMuPDF-PNG pipeline used for
+// the pixel-faithful preview/PDF editor) and embedding each page as a base64
+// image. This replaces LibreOffice's draw_html_Export filter, which was
+// confirmed to emit ZERO image references on real .pub files and reflows
+// everything into plain unpositioned paragraphs — there is no folder or data
+// URI to fix on that path, the filter simply drops images.
+func generateFaithfulHTML(pubPath, outPath string) error {
+	tmpDir, err := os.MkdirTemp("", "bondi-htmlgen-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tmpDir)
+	pdfPath, err := pubToPdf(pubPath, tmpDir)
+	if err != nil {
+		return fmt.Errorf("could not render pages: %w", err)
+	}
+
+	pngDir, files, err := renderPdfPagesToPNGs(pdfPath, 1400)
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(pngDir)
+
+	base := strings.TrimSuffix(filepath.Base(pubPath), filepath.Ext(pubPath))
+	var b strings.Builder
+	b.WriteString("<!DOCTYPE html>\n<html><head><meta charset=\"utf-8\">\n<title>")
+	b.WriteString(html.EscapeString(base))
+	b.WriteString("</title>\n<style>\n")
+	b.WriteString("body{margin:0;background:#e8e8e8;display:flex;flex-direction:column;align-items:center;gap:24px;padding:24px 0;}\n")
+	b.WriteString("img{max-width:100%;height:auto;box-shadow:0 2px 16px rgba(0,0,0,0.15);background:#fff;}\n")
+	b.WriteString("</style>\n</head><body>\n")
+	for _, f := range files {
+		data, err := os.ReadFile(f)
+		if err != nil {
+			return err
+		}
+		b.WriteString(`<img src="data:image/png;base64,`)
+		b.WriteString(base64.StdEncoding.EncodeToString(data))
+		b.WriteString("\">\n")
+	}
+	b.WriteString("</body></html>\n")
+	return os.WriteFile(outPath, []byte(b.String()), 0o644)
+}
+
+// PreviewPub renders the ORIGINAL .pub file's true layout as page images,
+// independent of whichever export format the user picked. pub->pdf (soffice)
+// is pixel-faithful (see RenderPdfToImages), so this gives an accurate "what
+// it really looks like" preview even when the chosen output format (e.g.
+// DOCX, which re-flows content through pdf2docx) can't preserve the exact
+// layout.
+func (a *App) PreviewPub(pubPath string) ([]string, error) {
+	tmpDir, err := os.MkdirTemp("", "bondi-pubpreview-*")
+	if err != nil {
+		return nil, err
+	}
+	defer os.RemoveAll(tmpDir)
+	pdfPath, err := pubToPdf(pubPath, tmpDir)
+	if err != nil {
+		return nil, fmt.Errorf("could not render preview: %w", err)
+	}
+	return a.RenderPdfToImages(pdfPath, 900)
+}
+
+var (
+	pub2xhtmlOnce sync.Once
+	pub2xhtmlPath string
+	pub2xhtmlErr  error
+)
+
+// resolvePub2Xhtml locates libmspub's pub2xhtml tool (cached). It reads the
+// Publisher file's OWN object model directly (via libmspub, the same parser
+// LibreOffice uses internally) and emits per-shape SVG with real coordinates
+// — unlike soffice's draw_html_Export (no images at all) or pdf2docx (guesses
+// paragraph structure from flattened PDF geometry).
+func resolvePub2Xhtml() (string, error) {
+	pub2xhtmlOnce.Do(func() {
+		candidates := []string{}
+		if p, err := exec.LookPath("pub2xhtml"); err == nil {
+			candidates = append(candidates, p)
+		}
+		candidates = append(candidates,
+			"/opt/homebrew/opt/libmspub/bin/pub2xhtml",
+			"/usr/local/opt/libmspub/bin/pub2xhtml",
+		)
+		for _, c := range candidates {
+			if _, err := os.Stat(c); err == nil {
+				pub2xhtmlPath = c
+				return
+			}
+		}
+		pub2xhtmlErr = fmt.Errorf("libmspub (pub2xhtml) not found — install it with 'brew install libmspub'")
+	})
+	return pub2xhtmlPath, pub2xhtmlErr
+}
+
+// extractLayoutScript parses pub2raw's output — the sequence of librevenge
+// drawing-interface calls libmspub makes internally, BEFORE any SVG/HTML
+// flattening — into a page/item geometry JSON.
+//
+// This replaced an earlier version that parsed pub2xhtml's SVG output. That
+// approach had no real frame width/height for text (SVG text is just
+// positioned glyph runs, not a bounded box), forcing width/height to be
+// heuristically guessed from neighboring items — which produced real
+// overlapping-text bugs no amount of heuristic tuning fully resolved.
+// pub2raw's startTextObject(...) calls carry the ACTUAL frame rectangle
+// (svg:x/y/width/height, all in inches) libmspub read from the file, so
+// text now gets placed and sized exactly like the original, no guessing.
+const extractLayoutScript = `
+import sys, re, json
+
+def get_args(line):
+    i = line.find("(")
+    j = line.rfind(")")
+    if i == -1 or j == -1 or j < i:
+        return ""
+    return line[i+1:j]
+
+def parse_flat_kv(args):
+    out = {}
+    for m in re.finditer(r"([\w:.\-]+):\s*([^,]+?)(?=,\s*[\w:.\-]+:|$)", args):
+        out[m.group(1)] = m.group(2).strip()
+    return out
+
+def in_to_pt(s):
+    try:
+        return round(float(s.replace("in", "").strip()) * 72, 2)
+    except (TypeError, ValueError):
+        return 0.0
+
+def bbox_from_points_pt(args):
+    xs = [float(x) * 72 for x in re.findall(r"svg:x:\s*([\d.]+)in", args)]
+    ys = [float(y) * 72 for y in re.findall(r"svg:y:\s*([\d.]+)in", args)]
+    if not xs or not ys:
+        return 0.0, 0.0, 0.0, 0.0
+    return min(xs), min(ys), max(xs), max(ys)
+
+ALIGN_MAP = {"left": "left", "center": "center", "right": "right", "justify": "justify"}
+
+def sniff_mime(b64_head):
+    if b64_head.startswith("/9j/"):
+        return "image/jpeg"
+    return "image/png"
+
+def main():
+    pages = []
+    cur_page = None
+    pending_fill_b64 = None
+    text_stack = []   # frames currently open (rare to nest, but handle it)
+    para_stack = []   # paragraphs currently open
+    span_stack = []   # run-attribute dicts currently open
+
+    with open(sys.argv[1], "r", encoding="utf-8", errors="replace") as f:
+        for raw_line in f:
+            stripped = raw_line.strip()
+            if not stripped:
+                continue
+            m = re.match(r"^(\w+)", stripped)
+            if not m:
+                continue
+            name = m.group(1)
+            args = get_args(stripped)
+
+            if name == "startPage":
+                kv = parse_flat_kv(args)
+                cur_page = {
+                    "widthPt": in_to_pt(kv.get("svg:width", "8.5in")),
+                    "heightPt": in_to_pt(kv.get("svg:height", "11in")),
+                    "items": [],
+                }
+            elif name == "endPage":
+                if cur_page:
+                    pages.append(cur_page)
+                cur_page = None
+            elif name == "setStyle":
+                if "draw:fill: bitmap" in args and "draw:fill-image:" in args:
+                    # base64 only contains [A-Za-z0-9+/=] — bound the match to
+                    # that so trailing attributes on the same setStyle call
+                    # (draw:mime-type, style:repeat, ...) aren't swept in too.
+                    b64_m = re.search(r"draw:fill-image:\s*([A-Za-z0-9+/=]+)", args)
+                    pending_fill_b64 = b64_m.group(1) if b64_m else None
+                else:
+                    pending_fill_b64 = None
+            elif name in ("drawPolygon", "drawRectangle"):
+                if pending_fill_b64 and cur_page is not None:
+                    x0, y0, x1, y1 = bbox_from_points_pt(args)
+                    if x1 > x0 and y1 > y0:
+                        href = "data:%s;base64,%s" % (sniff_mime(pending_fill_b64[:12]), pending_fill_b64)
+                        cur_page["items"].append({
+                            "type": "image", "x": x0, "y": y0,
+                            "w": x1 - x0, "h": y1 - y0, "href": href,
+                        })
+                pending_fill_b64 = None
+            elif name == "startTextObject":
+                kv = parse_flat_kv(args)
+                text_stack.append({
+                    "x": in_to_pt(kv.get("svg:x", "0in")),
+                    "y": in_to_pt(kv.get("svg:y", "0in")),
+                    "w": in_to_pt(kv.get("svg:width", "1in")),
+                    "h": in_to_pt(kv.get("svg:height", "0.2in")),
+                    "padLeft": in_to_pt(kv.get("fo:padding-left", "0in")),
+                    "padRight": in_to_pt(kv.get("fo:padding-right", "0in")),
+                    "padTop": in_to_pt(kv.get("fo:padding-top", "0in")),
+                    "padBottom": in_to_pt(kv.get("fo:padding-bottom", "0in")),
+                    "paragraphs": [],
+                })
+            elif name == "endTextObject":
+                if text_stack:
+                    frame = text_stack.pop()
+                    if any(p["runs"] for p in frame["paragraphs"]):
+                        item = dict(frame)
+                        item["type"] = "text"
+                        if cur_page is not None:
+                            cur_page["items"].append(item)
+            elif name == "openParagraph":
+                kv = parse_flat_kv(args)
+                lh_m = re.match(r"([\d.]+)%", kv.get("fo:line-height", ""))
+                para_stack.append({
+                    "align": ALIGN_MAP.get(kv.get("fo:text-align", "left"), "left"),
+                    "lineHeightPct": float(lh_m.group(1)) if lh_m else None,
+                    "runs": [],
+                })
+            elif name == "closeParagraph":
+                if para_stack:
+                    p = para_stack.pop()
+                    if text_stack:
+                        text_stack[-1]["paragraphs"].append(p)
+            elif name == "openSpan":
+                kv = parse_flat_kv(args)
+                span_stack.append({
+                    "fontFamily": kv.get("style:font-name", "Arial"),
+                    "sizePt": in_to_pt(kv.get("fo:font-size", "0.14in")),
+                    "bold": kv.get("fo:font-weight") == "bold",
+                    "italic": kv.get("fo:font-style") == "italic",
+                    "color": kv.get("fo:color", "#000000"),
+                })
+            elif name == "closeSpan":
+                if span_stack:
+                    span_stack.pop()
+            elif name == "insertText":
+                if span_stack and para_stack:
+                    attrs = span_stack[-1]
+                    para_stack[-1]["runs"].append({
+                        "text": args,
+                        "fontFamily": attrs["fontFamily"],
+                        "sizePt": attrs["sizePt"],
+                        "bold": attrs["bold"],
+                        "italic": attrs["italic"],
+                        "color": attrs["color"],
+                    })
+
+    print(json.dumps({"pages": pages}))
+
+main()
+`
+
+var (
+	pub2rawOnce sync.Once
+	pub2rawPath string
+	pub2rawErr  error
+)
+
+// resolvePub2Raw locates libmspub's pub2raw tool (cached). Unlike pub2xhtml
+// (used only for the PDF-render fallback, see pubToPdfFallback), pub2raw
+// dumps the raw librevenge drawing-interface calls libmspub makes — real
+// frame rectangles for text boxes, not just positioned glyph runs — which is
+// what ExtractPubLayout needs for accurate placement.
+func resolvePub2Raw() (string, error) {
+	pub2rawOnce.Do(func() {
+		candidates := []string{}
+		if p, err := exec.LookPath("pub2raw"); err == nil {
+			candidates = append(candidates, p)
+		}
+		candidates = append(candidates,
+			"/opt/homebrew/opt/libmspub/bin/pub2raw",
+			"/usr/local/opt/libmspub/bin/pub2raw",
+		)
+		for _, c := range candidates {
+			if _, err := os.Stat(c); err == nil {
+				pub2rawPath = c
+				return
+			}
+		}
+		pub2rawErr = fmt.Errorf("libmspub (pub2raw) not found — install it with 'brew install libmspub'")
+	})
+	return pub2rawPath, pub2rawErr
+}
+
+// ExtractPubLayout reads the ORIGINAL .pub file's real object model (via
+// libmspub's pub2raw) and returns a JSON geometry description — pages, each
+// with text frames (their TRUE rectangle, paragraphs, and runs) and images
+// at their true page-coordinate positions. Intended as the input to a
+// frontend DOCX builder that places content with absolutely positioned text
+// boxes/pictures, instead of pdf2docx's flattened-paragraph reconstruction
+// (see docx-editor.js).
+func (a *App) ExtractPubLayout(pubPath string) (string, error) {
+	pub2raw, err := resolvePub2Raw()
+	if err != nil {
+		return "", err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), sofficeTimeout)
+	defer cancel()
+	var rawOut bytes.Buffer
+	var stderr bytes.Buffer
+	cmd := exec.CommandContext(ctx, pub2raw, pubPath)
+	cmd.Stdout = &rawOut
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return "", fmt.Errorf("pub2raw timed out after %s on %s", sofficeTimeout, filepath.Base(pubPath))
+		}
+		return "", fmt.Errorf("pub2raw failed: %s", strings.TrimSpace(stderr.String()))
+	}
+
+	tmpDir, err := os.MkdirTemp("", "bondi-layout-*")
+	if err != nil {
+		return "", err
+	}
+	defer os.RemoveAll(tmpDir)
+	rawPath := filepath.Join(tmpDir, "doc.raw")
+	if err := os.WriteFile(rawPath, rawOut.Bytes(), 0o644); err != nil {
+		return "", err
+	}
+
+	py, err := findPythonWithPdf2docx()
+	if err != nil {
+		// This parsing script only needs the stdlib, so fall back to any
+		// python3 on PATH if the pdf2docx-specific one isn't available.
+		if p, lookErr := exec.LookPath("python3"); lookErr == nil {
+			py = p
+		} else {
+			return "", err
+		}
+	}
+	var stdout bytes.Buffer
+	stderr.Reset()
+	pyCmd := exec.CommandContext(ctx, py, "-c", extractLayoutScript, rawPath)
+	pyCmd.Stdout = &stdout
+	pyCmd.Stderr = &stderr
+	if err := pyCmd.Run(); err != nil {
+		return "", fmt.Errorf("layout extraction failed: %s", strings.TrimSpace(stderr.String()))
+	}
+	return stdout.String(), nil
+}
+
+var (
+	rsvgConvertOnce sync.Once
+	rsvgConvertPath string
+	rsvgConvertErr  error
+)
+
+// resolveRsvgConvert locates librsvg's rasterizer (cached). Used only by the
+// libmspub PDF fallback below — MuPDF's own built-in SVG renderer was tried
+// first and silently drops both pattern-fills (renders solid black) and all
+// text, so librsvg (a much more complete/correct SVG implementation) is used
+// instead to rasterize pub2xhtml's SVG pages.
+func resolveRsvgConvert() (string, error) {
+	rsvgConvertOnce.Do(func() {
+		candidates := []string{}
+		if p, err := exec.LookPath("rsvg-convert"); err == nil {
+			candidates = append(candidates, p)
+		}
+		candidates = append(candidates,
+			"/opt/homebrew/opt/librsvg/bin/rsvg-convert",
+			"/usr/local/opt/librsvg/bin/rsvg-convert",
+		)
+		for _, c := range candidates {
+			if _, err := os.Stat(c); err == nil {
+				rsvgConvertPath = c
+				return
+			}
+		}
+		rsvgConvertErr = fmt.Errorf("librsvg (rsvg-convert) not found — install it with 'brew install librsvg'")
+	})
+	return rsvgConvertPath, rsvgConvertErr
+}
+
+// pubFallbackScript rasterizes pub2xhtml's per-page SVG into a PDF, for
+// files where soffice's own Publisher import filter fails outright (real
+// case found: a large multi-object "website mockup" .pub that soffice can't
+// even load, while libmspub parses it fine — different import code paths).
+//
+// One fixup is required first: pub2xhtml emits font-size as a bare number
+// intended as INCHES (matching how x/y/width/height are also inches-as-bare-
+// numbers over a points-based viewBox), but the SVG spec says an unrooted
+// number is a "user unit" (≈px) — so standard renderers (confirmed on both
+// MuPDF and librsvg) render that text at ~1/72 the intended size, invisibly
+// thin. Multiplying by 72 before handing pages to rsvg-convert fixes this
+// the same way ExtractPubLayout's sizePt conversion already does.
+const pubFallbackScript = `
+import sys, re, os, subprocess
+import xml.etree.ElementTree as ET
+
+SVG = "http://www.w3.org/2000/svg"
+
+def fix_font_size(svg_text):
+    def repl(m):
+        return 'font-size="%.2f"' % (float(m.group(1)) * 72)
+    return re.sub(r'font-size="([\d.]+)"', repl, svg_text)
+
+def main():
+    xhtml_path, rsvg, out_pdf = sys.argv[1], sys.argv[2], sys.argv[3]
+    tmp_dir = os.path.dirname(out_pdf)
+    with open(xhtml_path, "r", encoding="utf-8", errors="replace") as f:
+        raw = f.read()
+    body = raw[raw.find("<body>") + 6 : raw.rfind("</body>")]
+    body = re.sub(r"<!--.*?-->", "", body, flags=re.S)
+    body = re.sub(r"<\?import[^>]*\?>", "", body)
+
+    page_chunks = re.findall(r"<svg:svg[^>]*>.*?</svg:svg>", body, re.S)
+    if not page_chunks:
+        print("no pages found in pub2xhtml output", file=sys.stderr)
+        sys.exit(1)
+
+    import fitz
+    doc = fitz.open()
+    for i, chunk in enumerate(page_chunks):
+        vb_m = re.search(r'viewBox="0 0 ([\d.]+) ([\d.]+)"', chunk)
+        page_w, page_h = (float(vb_m.group(1)), float(vb_m.group(2))) if vb_m else (612.0, 792.0)
+        svg_text = fix_font_size('<?xml version="1.0" encoding="UTF-8"?>\n' + chunk)
+        svg_path = os.path.join(tmp_dir, "page-%d.svg" % i)
+        png_path = os.path.join(tmp_dir, "page-%d.png" % i)
+        with open(svg_path, "w", encoding="utf-8") as f:
+            f.write(svg_text)
+        subprocess.run([rsvg, "-w", str(int(page_w * 2)), "-h", str(int(page_h * 2)),
+                         "-o", png_path, svg_path], check=True,
+                        capture_output=True)
+        page = doc.new_page(width=page_w, height=page_h)
+        page.insert_image(fitz.Rect(0, 0, page_w, page_h), filename=png_path)
+    # Without deflate/deflate_images, PyMuPDF re-embeds inserted images
+    # uncompressed — a single 390KB page PNG turned into a 31MB PDF page
+    # without these flags (confirmed while building this).
+    doc.save(out_pdf, deflate=True, deflate_images=True, garbage=4)
+    print(len(page_chunks))
+
+main()
+`
+
+// pubToPdfFallback renders pubPath to outPdfPath using libmspub + librosvg,
+// entirely independent of soffice. See pubFallbackScript for why this is
+// needed rather than just fixing the soffice call.
+func pubToPdfFallback(pubPath, outPdfPath string) error {
+	pub2xhtml, err := resolvePub2Xhtml()
+	if err != nil {
+		return err
+	}
+	rsvg, err := resolveRsvgConvert()
+	if err != nil {
+		return err
+	}
+	py, err := findPythonWithPdf2docx()
+	if err != nil {
+		if p, lookErr := exec.LookPath("python3"); lookErr == nil {
+			py = p
+		} else {
+			return err
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), sofficeTimeout)
+	defer cancel()
+
+	var svgOut, stderr bytes.Buffer
+	cmd := exec.CommandContext(ctx, pub2xhtml, pubPath)
+	cmd.Stdout = &svgOut
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("pub2xhtml failed: %s", strings.TrimSpace(stderr.String()))
+	}
+
+	tmpDir, err := os.MkdirTemp("", "bondi-pubfallback-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tmpDir)
+	xhtmlPath := filepath.Join(tmpDir, "doc.xhtml")
+	if err := os.WriteFile(xhtmlPath, svgOut.Bytes(), 0o644); err != nil {
+		return err
+	}
+
+	tmpPdf := filepath.Join(tmpDir, "out.pdf")
+	stderr.Reset()
+	pyCmd := exec.CommandContext(ctx, py, "-c", pubFallbackScript, xhtmlPath, rsvg, tmpPdf)
+	pyCmd.Stderr = &stderr
+	if err := pyCmd.Run(); err != nil {
+		return fmt.Errorf("libmspub fallback render failed: %s", strings.TrimSpace(stderr.String()))
+	}
+	return moveOrRename(tmpPdf, outPdfPath)
+}
+
+// pubToPdf converts pubPath to a PDF in outDir, trying soffice first (the
+// common case: fast, and matches what the "draw" chain does for every other
+// format) and falling back to the libmspub+librsvg path (pubToPdfFallback)
+// if soffice's own Publisher import filter fails to even load the file —
+// confirmed to happen on legitimate, non-corrupt .pub files that are just
+// unusually complex (many small objects), which libmspub parses fine.
+func pubToPdf(pubPath, outDir string) (string, error) {
+	base := strings.TrimSuffix(filepath.Base(pubPath), filepath.Ext(pubPath))
+	outPath := expectedOut(outDir, base, "pdf")
+	sofficeErr := soffice(pubPath, "pdf", outDir)
+	if sofficeErr == nil {
+		return outPath, nil
+	}
+	if fallbackErr := pubToPdfFallback(pubPath, outPath); fallbackErr != nil {
+		return "", fmt.Errorf("%w (fallback also failed: %s)", sofficeErr, fallbackErr)
+	}
+	return outPath, nil
+}
+
+func copyDir(src, dst string) error {
+	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, _ := filepath.Rel(src, path)
+		target := filepath.Join(dst, rel)
+		if info.IsDir() {
+			return os.MkdirAll(target, 0o755)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(target, data, 0o644)
+	})
 }
 
 var formats = []string{"pdf", "docx", "doc", "odt", "rtf", "txt", "png", "jpg", "svg", "html", "odg"}
@@ -91,6 +832,39 @@ type ConvertResult struct {
 	Error  string `json:"error,omitempty"`
 }
 
+// exportDir returns (creating if needed) the shared "Bondi Press Exports"
+// folder under $HOME. A plain top-level folder, deliberately NOT inside
+// Desktop/Documents/Downloads: those are macOS TCC-protected, and an ad-hoc/
+// dev-signed build's access to them is unreliable and can flip across
+// rebuilds (see handoff notes — this caused hard-to-diagnose "source file
+// could not be loaded" / "impl_store failed" errors that were really EPERM
+// in disguise).
+func exportDir() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		home, _ = os.Getwd()
+	}
+	outDir := filepath.Join(home, "Bondi Press Exports")
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		return "", err
+	}
+	return outDir, nil
+}
+
+// ExportPathFor computes the destination path for pubPath converted to
+// format inside the shared exports folder, creating that folder if needed.
+// Used by the frontend-driven DOCX layout pipeline (see docx-editor.js
+// layoutToDocxBytes), which can't go through ConvertBatch/convertTo since it
+// needs docx.js (a browser-only library) to build the bytes.
+func (a *App) ExportPathFor(pubPath, format string) (string, error) {
+	outDir, err := exportDir()
+	if err != nil {
+		return "", err
+	}
+	base := strings.TrimSuffix(filepath.Base(pubPath), filepath.Ext(pubPath))
+	return expectedOut(outDir, base, format), nil
+}
+
 // ConvertBatch converts many .pub files into a shared "Bondi Press exports"
 // folder in the user's Downloads directory.
 func (a *App) ConvertBatch(pubPaths []string, format string) []ConvertResult {
@@ -102,19 +876,17 @@ func (a *App) ConvertBatch(pubPaths []string, format string) []ConvertResult {
 		return results
 	}
 
-	home, err := os.UserHomeDir()
+	outDir, err := exportDir()
 	if err != nil {
-		home, _ = os.Getwd()
-	}
-	outDir := filepath.Join(home, "Downloads", "Bondi Press exports")
-	if err := os.MkdirAll(outDir, 0o755); err != nil {
 		for _, p := range pubPaths {
 			results = append(results, ConvertResult{Input: p, Status: "error", Error: err.Error()})
 		}
 		return results
 	}
 
-	for _, p := range pubPaths {
+	for i, p := range pubPaths {
+		name := filepath.Base(p)
+		runtime.EventsEmit(a.ctx, "conv:file", map[string]any{"index": i, "total": len(pubPaths), "name": name, "status": "start"})
 		outPath := expectedOut(outDir, strings.TrimSuffix(filepath.Base(p), filepath.Ext(p)), format)
 		r := ConvertResult{Input: p}
 		if _, err := a.convertTo(p, outPath, format); err != nil {
@@ -125,6 +897,7 @@ func (a *App) ConvertBatch(pubPaths []string, format string) []ConvertResult {
 			r.Output = outPath
 		}
 		results = append(results, r)
+		runtime.EventsEmit(a.ctx, "conv:file", map[string]any{"index": i, "total": len(pubPaths), "name": name, "status": r.Status})
 	}
 	return results
 }
@@ -145,8 +918,43 @@ func (a *App) CheckSoffice() (bool, string) {
 
 // CheckPdf2docx returns true if pdf2docx is importable in python3.
 func (a *App) CheckPdf2docx() bool {
-	cmd := exec.Command("python3", "-c", "from pdf2docx import Converter")
-	return cmd.Run() == nil
+	_, err := findPythonWithPdf2docx()
+	return err == nil
+}
+
+var (
+	pythonOnce sync.Once
+	pythonPath string
+	pythonErr  error
+)
+
+// findPythonWithPdf2docx returns a python3 binary that has pdf2docx installed.
+// GUI-launched apps don't inherit the user's shell PATH, so we must probe the
+// common Homebrew locations explicitly alongside PATH lookup. The result is
+// cached: probing spawns python + imports pdf2docx (~1s), which is too slow to
+// repeat on every conversion or the 5s status poll.
+func findPythonWithPdf2docx() (string, error) {
+	pythonOnce.Do(func() {
+		candidates := []string{}
+		if p, err := exec.LookPath("python3"); err == nil {
+			candidates = append(candidates, p)
+		}
+		candidates = append(candidates,
+			"/opt/homebrew/bin/python3",
+			"/usr/local/bin/python3",
+			"/opt/homebrew/bin/python3.13",
+			"/opt/homebrew/bin/python3.12",
+		)
+		for _, c := range candidates {
+			cmd := exec.Command(c, "-c", "import pdf2docx")
+			if cmd.Run() == nil {
+				pythonPath = c
+				return
+			}
+		}
+		pythonErr = fmt.Errorf("pdf2docx not found in any python3")
+	})
+	return pythonPath, pythonErr
 }
 
 func (a *App) Convert(pubPath, outPath, format string) (string, error) {
@@ -172,6 +980,27 @@ func (a *App) convertTo(pubPath, outPath, format string) (string, error) {
 	baseName := strings.TrimSuffix(filepath.Base(pubPath), filepath.Ext(pubPath))
 
 	if spec.chain == "draw" {
+		if format == "html" {
+			// LibreOffice's draw_html_Export emits zero image references and
+			// reflows content into plain paragraphs — use the faithful
+			// page-image renderer instead (see generateFaithfulHTML).
+			if err := generateFaithfulHTML(pubPath, outPath); err != nil {
+				return "", err
+			}
+			return outPath, nil
+		}
+		if format == "pdf" {
+			// pubToPdf falls back to the libmspub+librsvg pipeline if
+			// soffice's own Publisher import fails outright (see pubToPdf).
+			got, err := pubToPdf(pubPath, workDir)
+			if err != nil {
+				return "", err
+			}
+			if err := moveOrRename(got, outPath); err != nil {
+				return "", err
+			}
+			return outPath, nil
+		}
 		if err := soffice(pubPath, spec.ext, workDir); err != nil {
 			return "", err
 		}
@@ -189,9 +1018,10 @@ func (a *App) convertTo(pubPath, outPath, format string) (string, error) {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	// Step 1: pub → pdf
-	pdfPath := filepath.Join(tmpDir, baseName+".pdf")
-	if err := soffice(pubPath, "pdf", tmpDir); err != nil {
+	// Step 1: pub → pdf (soffice, falling back to libmspub+librsvg if soffice
+	// can't even load the file — see pubToPdf)
+	pdfPath, err := pubToPdf(pubPath, tmpDir)
+	if err != nil {
 		return "", fmt.Errorf("step 1 (pub→pdf): %w", err)
 	}
 
@@ -218,29 +1048,87 @@ func (a *App) convertTo(pubPath, outPath, format string) (string, error) {
 	return outPath, nil
 }
 
-func soffice(inputPath, targetExt, outDir string) error {
-	sofficePath, err := exec.LookPath("soffice")
-	if err != nil {
+var (
+	sofficeOnce sync.Once
+	sofficePath string
+	sofficeErr  error
+)
+
+// resolveSoffice locates the LibreOffice binary (cached).
+func resolveSoffice() (string, error) {
+	sofficeOnce.Do(func() {
+		p, err := exec.LookPath("soffice")
+		if err == nil {
+			sofficePath = p
+			return
+		}
 		candidate := "/Applications/LibreOffice.app/Contents/MacOS/soffice"
 		if _, stat := os.Stat(candidate); stat == nil {
 			sofficePath = candidate
-		} else {
-			return fmt.Errorf("LibreOffice not found — install it from libreoffice.org")
+			return
 		}
+		sofficeErr = fmt.Errorf("LibreOffice not found — install it from libreoffice.org")
+	})
+	return sofficePath, sofficeErr
+}
+
+// sofficeTimeout bounds every soffice invocation. Without it, a file that
+// makes soffice hang (e.g. a password-protected or malformed document
+// silently waiting on a dialog headless mode can't show) blocks forever —
+// the calling Wails method's promise never resolves and the UI just sits on
+// "Rendering preview…" / "Converting…" with no error, indefinitely.
+const sofficeTimeout = 120 * time.Second
+
+func soffice(inputPath, targetExt, outDir string) error {
+	sofficePath, err := resolveSoffice()
+	if err != nil {
+		return err
 	}
-	cmd := exec.Command(sofficePath,
+	ctx, cancel := context.WithTimeout(context.Background(), sofficeTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx,
+		sofficePath,
 		"--headless", "--norestore", "--nologo",
 		"--convert-to", targetExt,
 		"--outdir", outDir,
 		inputPath,
 	)
-	cmd.Dir = outDir
+	// --outdir and inputPath are both absolute, so cmd.Dir has no bearing on
+	// where files are read/written — but it still matters to soffice/macOS.
+	// outDir can be inside a TCC-protected folder (e.g. ~/Downloads); if the
+	// process lacks access there, soffice fails to even load the source file
+	// with a misleading "source file could not be loaded" error. Run from a
+	// neutral, always-accessible directory instead.
+	cmd.Dir = os.TempDir()
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("soffice failed: %s", strings.TrimSpace(stderr.String()))
+		if ctx.Err() == context.DeadlineExceeded {
+			return fmt.Errorf("soffice timed out after %s converting %s — the file may be corrupt, password-protected, or otherwise stuck", sofficeTimeout, filepath.Base(inputPath))
+		}
+		return fmt.Errorf("soffice failed: %s", cleanSofficeStderr(stderr.String()))
 	}
 	return nil
+}
+
+// cleanSofficeStderr strips soffice's routine, harmless "Fontconfig warning:
+// ..." startup noise so the actual error (if any) isn't buried behind it —
+// confirmed to matter in practice: with these left in, a real error can be
+// pushed entirely past the UI's truncated error display.
+func cleanSofficeStderr(s string) string {
+	var kept []string
+	for _, line := range strings.Split(s, "\n") {
+		if strings.Contains(line, "Fontconfig") {
+			continue
+		}
+		if line = strings.TrimSpace(line); line != "" {
+			kept = append(kept, line)
+		}
+	}
+	if len(kept) == 0 {
+		return "unknown error (no output)"
+	}
+	return strings.Join(kept, "; ")
 }
 
 func pdf2docx(pdfPath, docxPath string) error {
@@ -248,10 +1136,19 @@ func pdf2docx(pdfPath, docxPath string) error {
 		"from pdf2docx import Converter; c = Converter(%q); c.convert(%q); c.close()",
 		pdfPath, docxPath,
 	)
-	cmd := exec.Command("python3", "-c", script)
+	py, err := findPythonWithPdf2docx()
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), sofficeTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, py, "-c", script)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return fmt.Errorf("pdf2docx timed out after %s", sofficeTimeout)
+		}
 		return fmt.Errorf("pdf2docx failed: %s", strings.TrimSpace(stderr.String()))
 	}
 	return nil
@@ -296,4 +1193,113 @@ func (a *App) RevealFile(path string) error {
 		return exec.Command("open", "-R", path).Start()
 	}
 	return exec.Command("explorer", "/select,", path).Start()
+}
+
+// ReadBinaryFile returns a file's bytes base64-encoded so the frontend can
+// hand them to PDF.js / canvas APIs (offline, no fetch of file:// URLs).
+func (a *App) ReadBinaryFile(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	return base64.StdEncoding.EncodeToString(data), nil
+}
+
+// WriteBinaryFile writes base64 bytes back to an output file (e.g. edited PDF).
+func (a *App) WriteBinaryFile(path string, b64 string) error {
+	data, err := base64.StdEncoding.DecodeString(b64)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o644)
+}
+
+var textEditExts = map[string]bool{".html": true, ".txt": true, ".rtf": true, ".svg": true}
+
+// ReadConvertedFile returns the text content of a previously converted
+// HTML/TXT/RTF/SVG file so it can be reviewed and edited in-app.
+func (a *App) ReadConvertedFile(path string) (string, error) {
+	ext := strings.ToLower(filepath.Ext(path))
+	if !textEditExts[ext] {
+		return "", fmt.Errorf("only HTML, TXT, RTF and SVG files can be edited as text in-app")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+// SaveConvertedFile writes edited content back over a converted text-based file.
+func (a *App) SaveConvertedFile(path, content string) error {
+	ext := strings.ToLower(filepath.Ext(path))
+	if !textEditExts[ext] {
+		return fmt.Errorf("only HTML, TXT, RTF and SVG files can be edited as text in-app")
+	}
+	return os.WriteFile(path, []byte(content), 0o644)
+}
+
+// ConvertToDocxBytes returns base64-encoded DOCX bytes for a converted Word
+// file so the frontend can extract rich text (via mammoth) for editing.
+// DOCX files are read directly; legacy DOC/ODT are bridged through soffice
+// since mammoth only understands the DOCX zip format.
+func (a *App) ConvertToDocxBytes(path string) (string, error) {
+	ext := strings.ToLower(filepath.Ext(path))
+	if ext == ".docx" {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return "", err
+		}
+		return base64.StdEncoding.EncodeToString(data), nil
+	}
+	if ext != ".doc" && ext != ".odt" {
+		return "", fmt.Errorf("only DOCX, DOC and ODT files can be edited as rich text in-app")
+	}
+	tmpDir, err := os.MkdirTemp("", "bondi-docxbridge-*")
+	if err != nil {
+		return "", err
+	}
+	defer os.RemoveAll(tmpDir)
+	if err := soffice(path, "docx", tmpDir); err != nil {
+		return "", fmt.Errorf("could not prepare %s for editing: %w", ext, err)
+	}
+	base := strings.TrimSuffix(filepath.Base(path), ext)
+	data, err := os.ReadFile(filepath.Join(tmpDir, base+".docx"))
+	if err != nil {
+		return "", err
+	}
+	return base64.StdEncoding.EncodeToString(data), nil
+}
+
+// SaveDocxEditAs writes edited rich-text content back to path. docxB64 is a
+// freshly generated DOCX (from the frontend's HTML->DOCX writer). If the
+// original file is DOCX it's written directly; DOC/ODT are bridged back
+// through soffice so the file on disk keeps its original format.
+func (a *App) SaveDocxEditAs(path string, docxB64 string) error {
+	ext := strings.ToLower(filepath.Ext(path))
+	data, err := base64.StdEncoding.DecodeString(docxB64)
+	if err != nil {
+		return err
+	}
+	if ext == ".docx" {
+		return os.WriteFile(path, data, 0o644)
+	}
+	if ext != ".doc" && ext != ".odt" {
+		return fmt.Errorf("only DOCX, DOC and ODT files can be edited as rich text in-app")
+	}
+	tmpDir, err := os.MkdirTemp("", "bondi-docxbridge-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tmpDir)
+	base := strings.TrimSuffix(filepath.Base(path), ext)
+	tmpDocx := filepath.Join(tmpDir, base+".docx")
+	if err := os.WriteFile(tmpDocx, data, 0o644); err != nil {
+		return err
+	}
+	targetExt := strings.TrimPrefix(ext, ".")
+	if err := soffice(tmpDocx, targetExt, tmpDir); err != nil {
+		return fmt.Errorf("could not save as %s: %w", ext, err)
+	}
+	return moveOrRename(filepath.Join(tmpDir, base+"."+targetExt), path)
 }

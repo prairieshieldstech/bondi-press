@@ -409,6 +409,27 @@ body {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  flex: 1;
+}
+
+.progitem-state {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--muted);
+  flex-shrink: 0;
+}
+
+.progitem-dot.working {
+  background: #ffb020;
+  animation: pulse 1s ease-in-out infinite;
+}
+
+.progitem-dot.done { background: var(--ok); }
+.progitem-dot.fail { background: var(--off); }
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.35; transform: scale(0.8); }
 }
 
 /* ---------- Batch results ---------- */
@@ -444,6 +465,316 @@ body {
 .resultitem-state { font-size: 12px; flex-shrink: 0; }
 .resultitem.ok .resultitem-state { color: var(--ok); font-weight: 700; }
 .resultitem.error .resultitem-state { color: var(--off); font-size: 11px; max-width: 160px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+.resultitem-edit {
+  border: none;
+  background: none;
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  flex-shrink: 0;
+  padding: 3px 10px;
+  border-radius: 7px;
+  border: 1px solid var(--line-strong);
+  transition: background 0.12s, border-color 0.12s;
+}
+
+.resultitem-edit:hover { background: var(--ink); color: #fff; border-color: var(--ink); }
+
+/* ---------- Editor ---------- */
+.edit-split {
+  display: flex;
+  width: 100%;
+  max-width: 360px;
+  height: 320px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+  flex-shrink: 0;
+  margin-bottom: 8px;
+}
+
+.edit-split.hidden { display: none; }
+
+.edit-codepane, .edit-previewpane {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.edit-codepane { border-right: 1px solid var(--line); }
+
+.edit-codelabel {
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+  color: var(--muted);
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--line);
+  background: var(--surface-sub);
+  flex-shrink: 0;
+  text-align: center;
+}
+
+.edit-code {
+  flex: 1;
+  width: 100%;
+  resize: none;
+  padding: 10px 12px;
+  border: none;
+  outline: none;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--ink);
+  background: var(--surface);
+  user-select: text;
+  -webkit-user-select: text;
+  tab-size: 2;
+}
+
+.edit-previewframe {
+  flex: 1;
+  width: 100%;
+  border: none;
+  background: #fff;
+}
+
+.edit-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  width: 100%;
+  max-width: 360px;
+  padding: 6px;
+  margin-bottom: 8px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  flex-shrink: 0;
+}
+
+.etb {
+  min-width: 30px;
+  height: 28px;
+  padding: 0 7px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ink);
+  font-size: 12.5px;
+  cursor: pointer;
+  transition: background 0.12s;
+}
+
+.etb:hover { background: rgba(22, 24, 29, 0.07); }
+.etb em, .etb strong, .etb u { font-style: italic; }
+
+.etb-sep { width: 1px; height: 16px; background: var(--line); margin: 0 3px; }
+
+.edit-text {
+  width: 100%;
+  max-width: 360px;
+  min-height: 320px;
+  max-height: 360px;
+  resize: none;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--ink);
+  user-select: text;
+  -webkit-user-select: text;
+  flex-shrink: 0;
+}
+
+.edit-text:focus { outline: 2px solid var(--ink); outline-offset: 2px; }
+
+/* ---------- PDF editor ---------- */
+.pdfedit-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  width: 100%;
+  max-width: min(900px, 94vw);
+  padding: 6px;
+  margin-bottom: 8px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  flex-shrink: 0;
+}
+
+.pdfedit-page {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--muted);
+  min-width: 50px;
+  text-align: center;
+}
+
+.pdfedit-canvaswrap {
+  width: 100%;
+  /* Grows with the window (fullscreen included), stays compact in the
+     default small window since vw/vh track the actual window size. */
+  max-width: min(900px, 94vw);
+  min-height: 320px;
+  max-height: min(900px, 70vh);
+  overflow-y: auto;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface-sub);
+  box-shadow: var(--shadow);
+  flex-shrink: 0;
+}
+
+.pdfedit-pageitem {
+  position: relative;
+  margin: 10px auto;
+  line-height: 0;
+}
+
+.pdfedit-pageimg {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  border-radius: 4px;
+  box-shadow: 0 2px 12px rgba(0,0,0,0.08);
+  background: #fff;
+}
+
+.pdfedit-overlay {
+  position: absolute;
+  top: 0;
+  left: 0;
+  pointer-events: none;
+}
+
+.pdfoverlay {
+  position: absolute;
+  pointer-events: auto;
+  cursor: move;
+}
+
+.pdfoverlay.text {
+  background: rgba(255,255,255,0.0);
+  border: 1px dashed rgba(22,24,29,0.15);
+  padding: 2px 4px;
+  line-height: 1.3;
+  min-width: 40px;
+  outline: none;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.pdfoverlay.text:focus {
+  border-color: var(--ink);
+  background: rgba(255,255,255,0.6);
+}
+
+.pdfoverlay.image {
+  border: 2px solid transparent;
+}
+
+/* ---------- DOCX WYSIWYG canvas editor ---------- */
+/* .docxcanvas-outer is sized to the SCALED page (fits the responsive
+   container); .docxcanvas-page is the page at its true point-based size,
+   scaled down/up via transform so every child can just use raw pt values
+   as px without per-element scale math. */
+.docxcanvas-outer {
+  position: relative;
+  overflow: hidden;
+  margin: 10px auto;
+  background: #fff;
+  border-radius: 4px;
+  box-shadow: 0 2px 12px rgba(0,0,0,0.08);
+}
+
+.docxcanvas-page {
+  position: absolute;
+  top: 0;
+  left: 0;
+  transform-origin: top left;
+  background: #fff;
+}
+
+.docxcanvas-frame {
+  position: absolute;
+  outline: none;
+  overflow: hidden;
+  border: 1px dashed transparent;
+  cursor: text;
+}
+
+.docxcanvas-frame p { margin: 0; white-space: pre-wrap; word-break: break-word; }
+
+.docxcanvas-frame:hover { border-color: rgba(22,24,29,0.12); }
+.docxcanvas-frame:focus { border-color: var(--ink); background: rgba(255,255,255,0.7); }
+
+.docxcanvas-image {
+  position: absolute;
+  pointer-events: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.pdfoverlay.image:hover {
+  border-color: var(--ink);
+}
+
+/* ---------- Full-screen preview ---------- */
+.preview {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+  flex-direction: column;
+  background: var(--paper);
+}
+
+.preview[hidden] { display: none; }
+
+.preview-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--line);
+  background: var(--surface-sub);
+  flex-shrink: 0;
+}
+
+.preview-title {
+  flex: 1;
+  min-width: 0;
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--ink);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-align: center;
+}
+
+.preview-sheet {
+  flex: 1;
+  width: 100%;
+  border: none;
+  background: #fff;
+}
 
 /* ---------- Statusbar ---------- */
 .statusbar {
