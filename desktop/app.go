@@ -38,6 +38,7 @@ func NewApp() *App {
 
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
+	cleanupOldExe()
 	// Pre-warm LibreOffice's profile + font cache in the background so the
 	// first real conversion isn't stuck waiting ~40s on one-time init.
 	go func() {

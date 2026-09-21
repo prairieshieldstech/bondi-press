@@ -2,8 +2,8 @@ import './style.css';
 import { PdfEditor } from './pdf-editor';
 import { docxToHtml, htmlToDocxBytes, layoutToDocxBytes } from './docx-editor';
 
-import {Convert, ConvertBatch, Formats, SelectPubFile, SelectSavePath, CheckStatus, RevealFile, ReadConvertedFile, SaveConvertedFile, ReadBinaryFile, WriteBinaryFile, PreparePreview, CleanupPreview, RenderPdfToImages, PreviewPub, ConvertToDocxBytes, SaveDocxEditAs, ToggleFullscreen, ExtractPubLayout, ExportPathFor, InstallEngine} from '../wailsjs/go/main/App';
-import {EventsOn} from '../wailsjs/runtime/runtime';
+import {Convert, ConvertBatch, Formats, SelectPubFile, SelectSavePath, CheckStatus, RevealFile, ReadConvertedFile, SaveConvertedFile, ReadBinaryFile, WriteBinaryFile, PreparePreview, CleanupPreview, RenderPdfToImages, PreviewPub, ConvertToDocxBytes, SaveDocxEditAs, ToggleFullscreen, ExtractPubLayout, ExportPathFor, InstallEngine, GetVersion, CheckUpdate, InstallUpdate} from '../wailsjs/go/main/App';
+import {EventsOn, BrowserOpenURL} from '../wailsjs/runtime/runtime';
 import {WindowMinimise, Quit, OnFileDrop} from '../wailsjs/runtime/runtime';
 import logoUrl from './assets/logo.svg';
 
@@ -222,6 +222,7 @@ document.querySelector('#app').innerHTML = `
             <span class="dot" id="status-dot"></span>
             <span id="status-text">Checking engine…</span>
             <button id="status-setup" class="status-setup" hidden>Set up engine</button>
+            <button id="update-btn" class="update-btn" title="Check for updates">Check for updates</button>
         </footer>
     </div>
 `;
@@ -232,7 +233,7 @@ function el(id) { return document.getElementById(id); }
  'stage-pubpreview','pvw-sub','pvw-prevfile','pvw-filecount','pvw-nextfile','pvw-page','pvw-prev','pvw-next',
  'pvw-pageimg','pvw-back','pvw-confirm',
  'progress-title','progress-text','prog-list','stage-done','done-count','done-path','done-list',
- 'convert-another','status-dot','status-text','status-setup',
+ 'convert-another','status-dot','status-text','status-setup','update-btn',
  'stage-edit','edit-title','edit-sub','edit-toolbar','edit-split','edit-code','edit-previewframe',
  'edit-sheet','edit-text','edit-back','edit-save','edit-preview',
  'stage-pdfedit','pdfedit-title','pdfedit-sub','pdf-add-text','pdf-zoom-in','pdf-zoom-out','pdf-prev','pdf-next',
@@ -1008,6 +1009,46 @@ els['status-setup'].addEventListener('click', async () => {
         checkStatus();
     }
 });
+
+// ── Updates ──
+let updateInfo = null;
+let appVer = '';
+
+function renderUpdateBtn(note) {
+    const b = els['update-btn'];
+    b.classList.toggle('available', !!(updateInfo && updateInfo.available));
+    if (note) b.textContent = note;
+    else if (updateInfo && updateInfo.available) b.textContent = `Update to ${updateInfo.latest}`;
+    else b.textContent = appVer && appVer !== 'dev' ? `${appVer} · Check for updates` : 'Check for updates';
+}
+
+async function checkForUpdate(manual) {
+    if (manual) renderUpdateBtn('Checking…');
+    try {
+        updateInfo = await CheckUpdate();
+        renderUpdateBtn(manual && !updateInfo.available ? "You're up to date ✓" : null);
+        if (manual && !updateInfo.available) setTimeout(() => renderUpdateBtn(), 2500);
+    } catch (e) {
+        renderUpdateBtn(manual ? "Couldn't check — are you online?" : null);
+        if (manual) setTimeout(() => renderUpdateBtn(), 3000);
+    }
+}
+
+els['update-btn'].addEventListener('click', async () => {
+    if (!(updateInfo && updateInfo.available)) return checkForUpdate(true);
+    if (!updateInfo.canAuto) return BrowserOpenURL(updateInfo.url);
+    els['update-btn'].disabled = true;
+    renderUpdateBtn('Downloading update…');
+    try {
+        await InstallUpdate(); // app restarts itself on success
+    } catch (e) {
+        els['update-btn'].disabled = false;
+        renderUpdateBtn();
+        if (confirm('Automatic update did not work:\n' + String(e) + '\n\nOpen the download page instead?')) BrowserOpenURL(updateInfo.url);
+    }
+});
+
+GetVersion().then(v => { appVer = v; renderUpdateBtn(); if (v !== 'dev') checkForUpdate(false); });
 
 // Frameless window controls
 els['btn-fullscreen'].addEventListener('click', async () => {

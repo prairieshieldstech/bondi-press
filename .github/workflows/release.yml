@@ -59,7 +59,7 @@ jobs:
 
       # ── build ─────────────────────────────────────────────────────────────
       - name: Build app
-        run: wails build -platform ${{ matrix.platform }} -trimpath
+        run: wails build -platform ${{ matrix.platform }} -trimpath -ldflags "-X main.appVersion=${{ github.ref_name }}"
 
       # ── package (linux tar, mac zip, windows zip) ─────────────────────────
       - name: Package — macOS
