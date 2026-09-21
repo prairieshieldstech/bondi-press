@@ -100,10 +100,30 @@ jobs:
           msystem: MINGW64
           update: true
           install: >-
-            mingw-w64-x86_64-libmspub
+            mingw-w64-x86_64-toolchain
+            mingw-w64-x86_64-librevenge
+            mingw-w64-x86_64-boost
+            mingw-w64-x86_64-icu
+            mingw-w64-x86_64-zlib
+            mingw-w64-x86_64-pkgconf
             mingw-w64-x86_64-librsvg
             mingw-w64-x86_64-fontconfig
-            zip
+            autoconf automake libtool make tar xz curl zip
+
+      # MSYS2 has no libmspub package, so build it (plus its pub2xhtml/pub2raw
+      # tools) from the LibreOffice-hosted release tarball.
+      - name: Build libmspub
+        shell: msys2 {0}
+        run: |
+          curl -fL -o libmspub.tar.xz https://dev-www.libreoffice.org/src/libmspub-0.1.4.tar.xz
+          tar xf libmspub.tar.xz
+          cd libmspub-0.1.4
+          ./configure --prefix=/mingw64 --disable-static --enable-shared \
+            --disable-werror --without-docs --disable-tests \
+            CXXFLAGS="-O2 -std=gnu++17 -fpermissive -w"
+          make -j4
+          make install
+          ls /mingw64/bin | grep -i pub2
 
       - name: Collect tools + DLLs
         shell: msys2 {0}
