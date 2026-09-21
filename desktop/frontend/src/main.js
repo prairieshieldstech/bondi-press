@@ -2,7 +2,7 @@ import './style.css';
 import { PdfEditor } from './pdf-editor';
 import { docxToHtml, htmlToDocxBytes, layoutToDocxBytes } from './docx-editor';
 
-import {Convert, ConvertBatch, Formats, SelectPubFile, SelectSavePath, CheckStatus, RevealFile, ReadConvertedFile, SaveConvertedFile, ReadBinaryFile, WriteBinaryFile, PreparePreview, CleanupPreview, RenderPdfToImages, PreviewPub, ConvertToDocxBytes, SaveDocxEditAs, ToggleFullscreen, ExtractPubLayout, ExportPathFor} from '../wailsjs/go/main/App';
+import {Convert, ConvertBatch, Formats, SelectPubFile, SelectSavePath, CheckStatus, RevealFile, ReadConvertedFile, SaveConvertedFile, ReadBinaryFile, WriteBinaryFile, PreparePreview, CleanupPreview, RenderPdfToImages, PreviewPub, ConvertToDocxBytes, SaveDocxEditAs, ToggleFullscreen, ExtractPubLayout, ExportPathFor, InstallEngine} from '../wailsjs/go/main/App';
 import {EventsOn} from '../wailsjs/runtime/runtime';
 import {WindowMinimise, Quit, OnFileDrop} from '../wailsjs/runtime/runtime';
 import logoUrl from './assets/logo.svg';
@@ -221,6 +221,7 @@ document.querySelector('#app').innerHTML = `
         <footer class="statusbar">
             <span class="dot" id="status-dot"></span>
             <span id="status-text">Checking engine…</span>
+            <button id="status-setup" class="status-setup" hidden>Set up engine</button>
         </footer>
     </div>
 `;
@@ -231,7 +232,7 @@ function el(id) { return document.getElementById(id); }
  'stage-pubpreview','pvw-sub','pvw-prevfile','pvw-filecount','pvw-nextfile','pvw-page','pvw-prev','pvw-next',
  'pvw-pageimg','pvw-back','pvw-confirm',
  'progress-title','progress-text','prog-list','stage-done','done-count','done-path','done-list',
- 'convert-another','status-dot','status-text',
+ 'convert-another','status-dot','status-text','status-setup',
  'stage-edit','edit-title','edit-sub','edit-toolbar','edit-split','edit-code','edit-previewframe',
  'edit-sheet','edit-text','edit-back','edit-save','edit-preview',
  'stage-pdfedit','pdfedit-title','pdfedit-sub','pdf-add-text','pdf-zoom-in','pdf-zoom-out','pdf-prev','pdf-next',
@@ -978,12 +979,35 @@ els['docxedit-save'].addEventListener('click', async () => {
     }
 });
 
+let engineSetupRunning = false;
+
 async function checkStatus() {
+    if (engineSetupRunning) return;
     const st = await CheckStatus();
-    const ok = st && (st['soffice'] || st['pdf2docx']);
+    // Both are required: LibreOffice reads .pub, Python (pdf2docx/PyMuPDF) renders pages + DOCX.
+    const ok = st && st['soffice'] && st['pdf2docx'] && st['tools'];
     els['status-dot'].className = 'dot ' + (ok ? 'ok' : 'off');
-    els['status-text'].textContent = ok ? 'Engine ready' : 'Engine unavailable';
+    els['status-text'].textContent = ok ? 'Engine ready'
+        : 'Engine not set up' + (st && st['soffice'] ? ' (missing Python libraries)' : '');
+    els['status-setup'].hidden = !!ok;
 }
+
+EventsOn('engine:progress', msg => { els['status-text'].textContent = msg; });
+
+els['status-setup'].addEventListener('click', async () => {
+    engineSetupRunning = true;
+    els['status-setup'].hidden = true;
+    els['status-dot'].className = 'dot off';
+    els['status-text'].textContent = 'Setting up engine…';
+    try {
+        await InstallEngine();
+    } catch (err) {
+        alert('Engine setup failed:\n' + String(err));
+    } finally {
+        engineSetupRunning = false;
+        checkStatus();
+    }
+});
 
 // Frameless window controls
 els['btn-fullscreen'].addEventListener('click', async () => {

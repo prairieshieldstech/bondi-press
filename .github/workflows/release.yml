@@ -88,9 +88,59 @@ jobs:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}*
 
+  # ── Windows helper tools (libmspub + librsvg) ───────────────────────────────
+  # Downloaded by the app on first-run setup, so they never bloat the main zip.
+  windows-tools:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-libmspub
+            mingw-w64-x86_64-librsvg
+            mingw-w64-x86_64-fontconfig
+            zip
+
+      - name: Collect tools + DLLs
+        shell: msys2 {0}
+        run: |
+          mkdir -p tools/etc
+          for exe in pub2xhtml pub2raw rsvg-convert; do
+            cp /mingw64/bin/$exe.exe tools/
+            ldd /mingw64/bin/$exe.exe | awk '/\/mingw64\//{print $3}' | while read dll; do cp -n "$dll" tools/; done
+          done
+          cp -r /mingw64/etc/fonts tools/etc/fonts
+          ls -la tools
+          (cd tools && zip -r ../bondi-tools-windows.zip .)
+
+      - name: Smoke test (native Windows, no MSYS2 on PATH)
+        shell: pwsh
+        run: |
+          $env:FONTCONFIG_PATH = "$PWD\tools\etc\fonts"
+          $env:FONTCONFIG_FILE = "$PWD\tools\etc\fonts\fonts.conf"
+          $pub = Get-ChildItem "demo-files\8-Page Brochure.pub" | Select-Object -First 1
+          .\tools\pub2xhtml.exe $pub.FullName > out.xhtml
+          if ((Get-Item out.xhtml).Length -lt 1000) { throw "pub2xhtml produced no output" }
+          .\tools\pub2raw.exe $pub.FullName > out.raw
+          if ((Get-Item out.raw).Length -lt 1000) { throw "pub2raw produced no output" }
+          '<svg xmlns="http://www.w3.org/2000/svg" width="400" height="100"><text x="10" y="50" font-size="30" font-family="Arial">Bondi Press Aa</text></svg>' | Out-File -Encoding ascii t.svg
+          .\tools\rsvg-convert.exe -o t.png t.svg
+          if (-not (Test-Path t.png)) { throw "rsvg-convert failed" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bondi-tools-windows
+          path: |
+            bondi-tools-windows.zip
+            t.png
+
   # ── create github release from tags ─────────────────────────────────────────
   release:
-    needs: build
+    needs: [build, windows-tools]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
@@ -103,4 +153,4 @@ jobs:
           gh release create "$GITHUB_REF_NAME" \
             --repo "$GITHUB_REPOSITORY" \
             --generate-notes \
-            bondi-press-macOS/* bondi-press-Windows/* bondi-press-Linux/*
+            bondi-press-macOS/* bondi-press-Windows/* bondi-press-Linux/* bondi-tools-windows/bondi-tools-windows.zip

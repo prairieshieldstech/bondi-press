@@ -43,6 +43,7 @@ func (a *App) startup(ctx context.Context) {
 	go func() {
 		if p, err := resolveSoffice(); err == nil {
 			cmd := exec.Command(p, "--headless", "--norestore", "--nologo", "--terminate_after_init")
+	hideConsole(cmd)
 			cmd.Run()
 		}
 	}()
@@ -199,6 +200,7 @@ for i, page in enumerate(doc):
 	ctx, cancel := context.WithTimeout(context.Background(), sofficeTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, py, "-c", script, pdfPath, tmpDir, fmt.Sprintf("%d", targetW))
+	hideConsole(cmd)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -312,36 +314,16 @@ func (a *App) PreviewPub(pubPath string) ([]string, error) {
 	return a.RenderPdfToImages(pdfPath, 900)
 }
 
-var (
-	pub2xhtmlOnce sync.Once
-	pub2xhtmlPath string
-	pub2xhtmlErr  error
-)
-
 // resolvePub2Xhtml locates libmspub's pub2xhtml tool (cached). It reads the
 // Publisher file's OWN object model directly (via libmspub, the same parser
 // LibreOffice uses internally) and emits per-shape SVG with real coordinates
 // — unlike soffice's draw_html_Export (no images at all) or pdf2docx (guesses
 // paragraph structure from flattened PDF geometry).
 func resolvePub2Xhtml() (string, error) {
-	pub2xhtmlOnce.Do(func() {
-		candidates := []string{}
-		if p, err := exec.LookPath("pub2xhtml"); err == nil {
-			candidates = append(candidates, p)
-		}
-		candidates = append(candidates,
-			"/opt/homebrew/opt/libmspub/bin/pub2xhtml",
-			"/usr/local/opt/libmspub/bin/pub2xhtml",
-		)
-		for _, c := range candidates {
-			if _, err := os.Stat(c); err == nil {
-				pub2xhtmlPath = c
-				return
-			}
-		}
-		pub2xhtmlErr = fmt.Errorf("libmspub (pub2xhtml) not found — install it with 'brew install libmspub'")
-	})
-	return pub2xhtmlPath, pub2xhtmlErr
+	if p := findTool("pub2xhtml", "/opt/homebrew/opt/libmspub/bin/pub2xhtml", "/usr/local/opt/libmspub/bin/pub2xhtml"); p != "" {
+		return p, nil
+	}
+	return "", toolMissingErr("libmspub (pub2xhtml)", "brew install libmspub")
 }
 
 // extractLayoutScript parses pub2raw's output — the sequence of librevenge
@@ -504,11 +486,6 @@ def main():
 main()
 `
 
-var (
-	pub2rawOnce sync.Once
-	pub2rawPath string
-	pub2rawErr  error
-)
 
 // resolvePub2Raw locates libmspub's pub2raw tool (cached). Unlike pub2xhtml
 // (used only for the PDF-render fallback, see pubToPdfFallback), pub2raw
@@ -516,24 +493,10 @@ var (
 // frame rectangles for text boxes, not just positioned glyph runs — which is
 // what ExtractPubLayout needs for accurate placement.
 func resolvePub2Raw() (string, error) {
-	pub2rawOnce.Do(func() {
-		candidates := []string{}
-		if p, err := exec.LookPath("pub2raw"); err == nil {
-			candidates = append(candidates, p)
-		}
-		candidates = append(candidates,
-			"/opt/homebrew/opt/libmspub/bin/pub2raw",
-			"/usr/local/opt/libmspub/bin/pub2raw",
-		)
-		for _, c := range candidates {
-			if _, err := os.Stat(c); err == nil {
-				pub2rawPath = c
-				return
-			}
-		}
-		pub2rawErr = fmt.Errorf("libmspub (pub2raw) not found — install it with 'brew install libmspub'")
-	})
-	return pub2rawPath, pub2rawErr
+	if p := findTool("pub2raw", "/opt/homebrew/opt/libmspub/bin/pub2raw", "/usr/local/opt/libmspub/bin/pub2raw"); p != "" {
+		return p, nil
+	}
+	return "", toolMissingErr("libmspub (pub2raw)", "brew install libmspub")
 }
 
 // ExtractPubLayout reads the ORIGINAL .pub file's real object model (via
@@ -553,6 +516,7 @@ func (a *App) ExtractPubLayout(pubPath string) (string, error) {
 	var rawOut bytes.Buffer
 	var stderr bytes.Buffer
 	cmd := exec.CommandContext(ctx, pub2raw, pubPath)
+	hideConsole(cmd)
 	cmd.Stdout = &rawOut
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
@@ -576,7 +540,7 @@ func (a *App) ExtractPubLayout(pubPath string) (string, error) {
 	if err != nil {
 		// This parsing script only needs the stdlib, so fall back to any
 		// python3 on PATH if the pdf2docx-specific one isn't available.
-		if p, lookErr := exec.LookPath("python3"); lookErr == nil {
+		if p, lookErr := lookPython(); lookErr == nil {
 			py = p
 		} else {
 			return "", err
@@ -585,6 +549,7 @@ func (a *App) ExtractPubLayout(pubPath string) (string, error) {
 	var stdout bytes.Buffer
 	stderr.Reset()
 	pyCmd := exec.CommandContext(ctx, py, "-c", extractLayoutScript, rawPath)
+	hideConsole(pyCmd)
 	pyCmd.Stdout = &stdout
 	pyCmd.Stderr = &stderr
 	if err := pyCmd.Run(); err != nil {
@@ -593,36 +558,16 @@ func (a *App) ExtractPubLayout(pubPath string) (string, error) {
 	return stdout.String(), nil
 }
 
-var (
-	rsvgConvertOnce sync.Once
-	rsvgConvertPath string
-	rsvgConvertErr  error
-)
-
 // resolveRsvgConvert locates librsvg's rasterizer (cached). Used only by the
 // libmspub PDF fallback below — MuPDF's own built-in SVG renderer was tried
 // first and silently drops both pattern-fills (renders solid black) and all
 // text, so librsvg (a much more complete/correct SVG implementation) is used
 // instead to rasterize pub2xhtml's SVG pages.
 func resolveRsvgConvert() (string, error) {
-	rsvgConvertOnce.Do(func() {
-		candidates := []string{}
-		if p, err := exec.LookPath("rsvg-convert"); err == nil {
-			candidates = append(candidates, p)
-		}
-		candidates = append(candidates,
-			"/opt/homebrew/opt/librsvg/bin/rsvg-convert",
-			"/usr/local/opt/librsvg/bin/rsvg-convert",
-		)
-		for _, c := range candidates {
-			if _, err := os.Stat(c); err == nil {
-				rsvgConvertPath = c
-				return
-			}
-		}
-		rsvgConvertErr = fmt.Errorf("librsvg (rsvg-convert) not found — install it with 'brew install librsvg'")
-	})
-	return rsvgConvertPath, rsvgConvertErr
+	if p := findTool("rsvg-convert", "/opt/homebrew/opt/librsvg/bin/rsvg-convert", "/usr/local/opt/librsvg/bin/rsvg-convert"); p != "" {
+		return p, nil
+	}
+	return "", toolMissingErr("librsvg (rsvg-convert)", "brew install librsvg")
 }
 
 // pubFallbackScript rasterizes pub2xhtml's per-page SVG into a PDF, for
@@ -700,7 +645,7 @@ func pubToPdfFallback(pubPath, outPdfPath string) error {
 	}
 	py, err := findPythonWithPdf2docx()
 	if err != nil {
-		if p, lookErr := exec.LookPath("python3"); lookErr == nil {
+		if p, lookErr := lookPython(); lookErr == nil {
 			py = p
 		} else {
 			return err
@@ -712,6 +657,7 @@ func pubToPdfFallback(pubPath, outPdfPath string) error {
 
 	var svgOut, stderr bytes.Buffer
 	cmd := exec.CommandContext(ctx, pub2xhtml, pubPath)
+	hideConsole(cmd)
 	cmd.Stdout = &svgOut
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
@@ -731,6 +677,8 @@ func pubToPdfFallback(pubPath, outPdfPath string) error {
 	tmpPdf := filepath.Join(tmpDir, "out.pdf")
 	stderr.Reset()
 	pyCmd := exec.CommandContext(ctx, py, "-c", pubFallbackScript, xhtmlPath, rsvg, tmpPdf)
+	pyCmd.Env = toolEnv()
+	hideConsole(pyCmd)
 	pyCmd.Stderr = &stderr
 	if err := pyCmd.Run(); err != nil {
 		return fmt.Errorf("libmspub fallback render failed: %s", strings.TrimSpace(stderr.String()))
@@ -904,16 +852,8 @@ func (a *App) ConvertBatch(pubPaths []string, format string) []ConvertResult {
 
 // CheckSoffice returns true if LibreOffice is installed and reachable.
 func (a *App) CheckSoffice() (bool, string) {
-	p, err := exec.LookPath("soffice")
-	if err != nil {
-		// Try common macOS path
-		candidate := "/Applications/LibreOffice.app/Contents/MacOS/soffice"
-		if _, stat := os.Stat(candidate); stat == nil {
-			return true, candidate
-		}
-		return false, ""
-	}
-	return true, p
+	p, err := resolveSoffice()
+	return err == nil, p
 }
 
 // CheckPdf2docx returns true if pdf2docx is importable in python3.
@@ -923,38 +863,62 @@ func (a *App) CheckPdf2docx() bool {
 }
 
 var (
-	pythonOnce sync.Once
+	pythonMu   sync.Mutex
 	pythonPath string
-	pythonErr  error
 )
+
+func resetPythonCache() {
+	pythonMu.Lock()
+	pythonPath = ""
+	pythonMu.Unlock()
+}
 
 // findPythonWithPdf2docx returns a python3 binary that has pdf2docx installed.
 // GUI-launched apps don't inherit the user's shell PATH, so we must probe the
 // common Homebrew locations explicitly alongside PATH lookup. The result is
 // cached: probing spawns python + imports pdf2docx (~1s), which is too slow to
 // repeat on every conversion or the 5s status poll.
+func pythonNames() []string {
+	if goruntime.GOOS == "windows" {
+		// python.org installs python.exe + the py launcher; there is no python3.exe
+		// (the Store stub of that name doesn't run real code).
+		return []string{"python", "py"}
+	}
+	return []string{"python3"}
+}
+
+func lookPython() (string, error) {
+	for _, n := range pythonNames() {
+		if p, err := exec.LookPath(n); err == nil {
+			return p, nil
+		}
+	}
+	return "", fmt.Errorf("python not found")
+}
+
 func findPythonWithPdf2docx() (string, error) {
-	pythonOnce.Do(func() {
-		candidates := []string{}
-		if p, err := exec.LookPath("python3"); err == nil {
-			candidates = append(candidates, p)
+	pythonMu.Lock()
+	defer pythonMu.Unlock()
+	if pythonPath != "" {
+		return pythonPath, nil
+	}
+	candidates := pythonPathCandidates()
+	candidates = append(candidates, realPythonCandidates()...)
+	candidates = append(candidates,
+		"/opt/homebrew/bin/python3",
+		"/usr/local/bin/python3",
+		"/opt/homebrew/bin/python3.13",
+		"/opt/homebrew/bin/python3.12",
+	)
+	for _, c := range candidates {
+		cmd := exec.Command(c, "-c", "import pdf2docx, fitz")
+		hideConsole(cmd)
+		if cmd.Run() == nil {
+			pythonPath = c
+			return c, nil
 		}
-		candidates = append(candidates,
-			"/opt/homebrew/bin/python3",
-			"/usr/local/bin/python3",
-			"/opt/homebrew/bin/python3.13",
-			"/opt/homebrew/bin/python3.12",
-		)
-		for _, c := range candidates {
-			cmd := exec.Command(c, "-c", "import pdf2docx")
-			if cmd.Run() == nil {
-				pythonPath = c
-				return
-			}
-		}
-		pythonErr = fmt.Errorf("pdf2docx not found in any python3")
-	})
-	return pythonPath, pythonErr
+	}
+	return "", fmt.Errorf("pdf2docx/PyMuPDF not found in any python — run setup from the status bar")
 }
 
 func (a *App) Convert(pubPath, outPath, format string) (string, error) {
@@ -1049,27 +1013,53 @@ func (a *App) convertTo(pubPath, outPath, format string) (string, error) {
 }
 
 var (
-	sofficeOnce sync.Once
+	sofficeMu   sync.Mutex
 	sofficePath string
-	sofficeErr  error
 )
 
-// resolveSoffice locates the LibreOffice binary (cached).
+// sofficeCandidates lists where LibreOffice lives per-OS. GUI-launched apps
+// don't inherit the shell PATH, and the Windows installer does not add
+// LibreOffice to PATH at all, so PATH lookup alone misses most installs.
+func sofficeCandidates() []string {
+	switch goruntime.GOOS {
+	case "windows":
+		var out []string
+		for _, env := range []string{"ProgramFiles", "ProgramFiles(x86)", "ProgramW6432", "LOCALAPPDATA"} {
+			if base := os.Getenv(env); base != "" {
+				out = append(out, filepath.Join(base, "LibreOffice", "program", "soffice.exe"))
+				out = append(out, filepath.Join(base, "Programs", "LibreOffice", "program", "soffice.exe"))
+			}
+		}
+		out = append(out,
+			`C:\Program Files\LibreOffice\program\soffice.exe`,
+			`C:\Program Files (x86)\LibreOffice\program\soffice.exe`)
+		return out
+	case "darwin":
+		return []string{"/Applications/LibreOffice.app/Contents/MacOS/soffice"}
+	default:
+		return []string{"/usr/bin/soffice", "/usr/local/bin/soffice", "/opt/libreoffice/program/soffice", "/snap/bin/libreoffice"}
+	}
+}
+
+// resolveSoffice locates the LibreOffice binary (cached only on success, so
+// installing LibreOffice while the app is open is picked up without a restart).
 func resolveSoffice() (string, error) {
-	sofficeOnce.Do(func() {
-		p, err := exec.LookPath("soffice")
-		if err == nil {
-			sofficePath = p
-			return
+	sofficeMu.Lock()
+	defer sofficeMu.Unlock()
+	if sofficePath != "" {
+		return sofficePath, nil
+	}
+	if p, err := exec.LookPath("soffice"); err == nil {
+		sofficePath = p
+		return p, nil
+	}
+	for _, c := range sofficeCandidates() {
+		if _, err := os.Stat(c); err == nil {
+			sofficePath = c
+			return c, nil
 		}
-		candidate := "/Applications/LibreOffice.app/Contents/MacOS/soffice"
-		if _, stat := os.Stat(candidate); stat == nil {
-			sofficePath = candidate
-			return
-		}
-		sofficeErr = fmt.Errorf("LibreOffice not found — install it from libreoffice.org")
-	})
-	return sofficePath, sofficeErr
+	}
+	return "", fmt.Errorf("LibreOffice not found — install it from libreoffice.org (Windows: 'winget install TheDocumentFoundation.LibreOffice'), then reopen Bondi Press")
 }
 
 // sofficeTimeout bounds every soffice invocation. Without it, a file that
@@ -1093,6 +1083,7 @@ func soffice(inputPath, targetExt, outDir string) error {
 		"--outdir", outDir,
 		inputPath,
 	)
+	hideConsole(cmd)
 	// --outdir and inputPath are both absolute, so cmd.Dir has no bearing on
 	// where files are read/written — but it still matters to soffice/macOS.
 	// outDir can be inside a TCC-protected folder (e.g. ~/Downloads); if the
@@ -1143,6 +1134,7 @@ func pdf2docx(pdfPath, docxPath string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), sofficeTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, py, "-c", script)
+	hideConsole(cmd)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
@@ -1181,6 +1173,7 @@ func (a *App) CheckStatus() map[string]bool {
 	return map[string]bool{
 		"soffice":   ok,
 		"pdf2docx": a.CheckPdf2docx(),
+		"tools":    goruntime.GOOS != "windows" || toolsInstalled(),
 	}
 }
 
