@@ -120,7 +120,7 @@ jobs:
           cd libmspub-0.1.4
           ./configure --prefix=/mingw64 --disable-static --enable-shared \
             --disable-werror --without-docs --disable-tests \
-            CXXFLAGS="-O2 -std=gnu++17 -fpermissive -w"
+            CXXFLAGS="-O2 -std=gnu++17 -include cstdint -fpermissive -w"
           make -j4
           make install
           ls /mingw64/bin | grep -i pub2
