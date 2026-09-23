@@ -933,12 +933,79 @@ func pubToPdf(pubPath, outDir string) (string, error) {
 	outPath := expectedOut(outDir, base, "pdf")
 	sofficeErr := soffice(pubPath, "pdf", outDir)
 	if sofficeErr == nil {
+		paginateOversizedPdf(outPath)
 		return outPath, nil
 	}
 	if fallbackErr := pubToPdfFallback(pubPath, outPath); fallbackErr != nil {
 		return "", fmt.Errorf("%w (fallback also failed: %s)", sofficeErr, fallbackErr)
 	}
+	paginateOversizedPdf(outPath)
 	return outPath, nil
+}
+
+// paginatePdfScript slices any page much taller than a standard print page
+// into consecutive Letter-sized (8.5x11in) pages, for Publisher's "long
+// scrolling web page" design type — a single logical "page" in the source
+// file can be many feet tall (confirmed on a real file: 48in), which prints
+// and previews as one unusable continuous sheet rather than a normal
+// multi-page document.
+//
+// Uses show_pdf_page (not a re-render): each output page just draws a
+// clipped window of the ORIGINAL page's real content — vector text and
+// embedded images stay exactly as they were, nothing is rasterized, and
+// pages that are already a normal size pass through untouched.
+const paginatePdfScript = `
+import sys, os
+import fitz
+
+PAGE_W, PAGE_H = 612.0, 792.0  # US Letter, points
+THRESHOLD = PAGE_H * 1.4
+
+def main():
+    path = sys.argv[1]
+    src = fitz.open(path)
+    if not any(p.rect.height > THRESHOLD for p in src):
+        return
+    out = fitz.open()
+    for page in src:
+        w, h = page.rect.width, page.rect.height
+        if h <= THRESHOLD:
+            new_page = out.new_page(width=PAGE_W, height=PAGE_H)
+            new_page.show_pdf_page(new_page.rect, src, page.number)
+            continue
+        scale = PAGE_W / w
+        band_h_src = PAGE_H / scale
+        y = 0.0
+        while y < h - 0.01:
+            band_h = min(band_h_src, h - y)
+            out_h = band_h * scale
+            new_page = out.new_page(width=PAGE_W, height=out_h)
+            clip = fitz.Rect(0, y, w, y + band_h)
+            new_page.show_pdf_page(fitz.Rect(0, 0, PAGE_W, out_h), src, page.number, clip=clip)
+            y += band_h_src
+    tmp = path + ".paginated.tmp"
+    out.save(tmp, deflate=True, garbage=4)
+    out.close()
+    src.close()
+    os.replace(tmp, path)
+
+main()
+`
+
+// paginateOversizedPdf runs paginatePdfScript in place on pdfPath. Best
+// effort: a failure here (e.g. no python available) leaves the PDF exactly
+// as it was — oversized pages, same as before this existed — rather than
+// failing a conversion that otherwise succeeded.
+func paginateOversizedPdf(pdfPath string) {
+	py, err := findPythonWithPdf2docx()
+	if err != nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), sofficeTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, py, "-c", paginatePdfScript, pdfPath)
+	hideConsole(cmd)
+	cmd.Run() // best effort — errors intentionally ignored, see doc comment
 }
 
 func copyDir(src, dst string) error {
