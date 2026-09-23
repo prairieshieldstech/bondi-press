@@ -1023,16 +1023,29 @@ def page_breaks(bands, total_h, band_h_src):
         # may still be a real gap nearby worth reaching for instead of
         # cutting blind through whatever's still running.
         lo, hi = y + band_h_src * 0.4, min(y + band_h_src * 1.4, total_h)
-        best_cut, best_dist = None, None
+        # Among gaps overlapping the window, prefer the LARGEST one (its
+        # real, full size — not clamped to the window), not just whichever
+        # is nearest to target. A small incidental gap (paragraph spacing
+        # right before a short trailing block like a footer) is very often
+        # closer to target than the real structural gap — e.g. the large
+        # blank stretch AFTER that footer — which picking by pure distance
+        # was choosing wrong: it cut right before the footer instead of
+        # after it, stranding the footer alone at the top of the next page
+        # with nothing else on it. Closeness to target only breaks ties
+        # among gaps that are comparably large (within half the biggest).
+        candidates = []
         for g0, g1 in gaps:
             cg0, cg1 = max(g0, lo), min(g1, hi)
             if cg1 <= cg0:
                 continue
-            mid = (cg0 + cg1) / 2.0
-            dist = abs(mid - target)
-            if best_dist is None or dist < best_dist:
-                best_dist, best_cut = dist, mid
-        cut = best_cut if best_cut is not None else target
+            candidates.append((g1 - g0, (cg0 + cg1) / 2.0))
+        cut = None
+        if candidates:
+            max_size = max(c[0] for c in candidates)
+            near_max = [c for c in candidates if c[0] >= max_size * 0.5]
+            cut = min(near_max, key=lambda c: abs(c[1] - target))[1]
+        if cut is None:
+            cut = target
         if cut <= y + 1.0:
             cut = target  # safety: never emit a zero-height page / infinite loop
         breaks.append(cut)
