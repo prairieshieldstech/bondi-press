@@ -342,12 +342,78 @@ func resolvePub2Xhtml() (string, error) {
 const extractLayoutScript = `
 import sys, re, json
 
-def get_args(line):
-    i = line.find("(")
-    j = line.rfind(")")
-    if i == -1 or j == -1 or j < i:
-        return ""
-    return line[i+1:j]
+# pub2raw's own pretty-printer wraps long calls across multiple lines — the
+# closing ")" of a call can land on its own line, or even several lines down
+# (confirmed on real files: ` + "`" + `insertText (About Bondi` + "`" + `, closing ` + "`" + `)` + "`" + ` on the
+# next line; also confirmed with a NESTED paren before the wrap, e.g.
+# ` + "`" + `insertText (Robert I. I. (Bob) Bondi` + "`" + ` then ` + "`" + `)` + "`" + ` on the next line). A line-by-line
+# parser (find "(", rfind ")" ON THAT LINE) silently drops such a call's
+# text entirely when no ")" is on the same line — real nav/heading text was
+# going missing on real customer files this way, not a rare edge case.
+#
+# Two simpler fixes were tried and reverted before this one:
+#   - A whole-file paren-DEPTH counter handles the wrapping fine, but plain
+#     text routinely contains its OWN unmatched parens ("1) ... 2) ... 3)"),
+#     and a depth counter treats every stray ")" as closing the call —
+#     truncating text a same-line rfind would have gotten right.
+#   - Falling back to reading more lines only when a line has an unmatched
+#     OPEN paren and NO ")" at all misses the case above: a line can have a
+#     ")" (closing an unrelated nested "(Bob)") while the call's OWN closing
+#     paren is still further down.
+#
+# What actually distinguishes a real call boundary from a stray paren in
+# text is the call NAME itself: it's one of a small, fixed vocabulary
+# librevenge's generator emits, which real document text never collides
+# with. So: find every line that starts with a known call name, and treat
+# everything from there up to the START of the next such line as that
+# call's own (possibly multi-line, paren-messy) content — then just take
+# everything after its first "(" and before its last ")" as args, with no
+# paren-balancing needed at all since the NEXT call's start line already
+# marks where this one's content ends.
+CALL_NAMES = {
+    "startDocument", "endDocument", "setDocumentMetaData",
+    "startPage", "endPage", "startLayer", "endLayer",
+    "startEmbeddedGraphics", "endEmbeddedGraphics", "openGroup", "closeGroup",
+    "setStyle",
+    "drawRectangle", "drawEllipse", "drawPolyline", "drawPolygon", "drawPath",
+    "drawGraphicObject", "drawConnector",
+    "startTextObject", "endTextObject",
+    "startTableObject", "endTableObject",
+    "openTableRow", "closeTableRow", "openTableCell", "closeTableCell",
+    "insertCoveredTableCell",
+    "openParagraph", "closeParagraph", "openSpan", "closeSpan",
+    "openLink", "closeLink",
+    "insertTab", "insertSpace", "insertLineBreak", "insertField", "insertText",
+    "openOrderedListLevel", "closeOrderedListLevel",
+    "openUnorderedListLevel", "closeUnorderedListLevel",
+    "openListElement", "closeListElement",
+    "defineEmbeddedFont", "definePageStyle", "defineParagraphStyle",
+    "defineCharacterStyle", "defineSectionStyle", "openSection", "closeSection",
+}
+
+def scan_calls(text):
+    lines = text.split("\n")
+    starts = []
+    ident = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)")
+    for idx, line in enumerate(lines):
+        s = line.strip()
+        if not s:
+            continue
+        m = ident.match(s)
+        if m and m.group(1) in CALL_NAMES:
+            starts.append((idx, m.group(1)))
+    calls = []
+    for n, (idx, name) in enumerate(starts):
+        end_idx = starts[n + 1][0] if n + 1 < len(starts) else len(lines)
+        chunk = "\n".join(lines[idx:end_idx])
+        i = chunk.find("(")
+        if i == -1:
+            calls.append((name, ""))
+            continue
+        j = chunk.rfind(")")
+        args = chunk[i + 1:j] if j > i else chunk[i + 1:]
+        calls.append((name, args.replace("\n", " ")))
+    return calls
 
 def parse_flat_kv(args):
     out = {}
@@ -384,16 +450,9 @@ def main():
     span_stack = []   # run-attribute dicts currently open
 
     with open(sys.argv[1], "r", encoding="utf-8", errors="replace") as f:
-        for raw_line in f:
-            stripped = raw_line.strip()
-            if not stripped:
-                continue
-            m = re.match(r"^(\w+)", stripped)
-            if not m:
-                continue
-            name = m.group(1)
-            args = get_args(stripped)
+        text = f.read()
 
+    for name, args in scan_calls(text):
             if name == "startPage":
                 kv = parse_flat_kv(args)
                 cur_page = {
@@ -466,6 +525,7 @@ def main():
                     "bold": kv.get("fo:font-weight") == "bold",
                     "italic": kv.get("fo:font-style") == "italic",
                     "color": kv.get("fo:color", "#000000"),
+                    "uppercase": kv.get("fo:text-transform") == "uppercase",
                 })
             elif name == "closeSpan":
                 if span_stack:
@@ -474,7 +534,7 @@ def main():
                 if span_stack and para_stack:
                     attrs = span_stack[-1]
                     para_stack[-1]["runs"].append({
-                        "text": args,
+                        "text": args.upper() if attrs["uppercase"] else args,
                         "fontFamily": attrs["fontFamily"],
                         "sizePt": attrs["sizePt"],
                         "bold": attrs["bold"],
@@ -647,14 +707,14 @@ def hex_to_rgb(h):
     except ValueError:
         return (0.0, 0.0, 0.0)
 
-def tokenize(runs):
+def tokenize(runs, scale=1.0):
     # (text, font, size, color) per whitespace-or-word chunk, spanning every
     # run in the paragraph so wrapping can break at any word regardless of
     # which run (bold/italic/size change) it falls in.
     out = []
     for run in runs:
         font = pick_font(run.get("fontFamily"), run.get("bold"), run.get("italic"))
-        size = run.get("sizePt") or 10.0
+        size = (run.get("sizePt") or 10.0) * scale
         color = hex_to_rgb(run.get("color"))
         for tok in re.findall(r"\S+|\s+", run.get("text", "")):
             out.append((tok, font, size, color))
@@ -677,22 +737,45 @@ def wrap_lines(tokens, max_w):
         lines.append((cur, cur_w))
     return lines
 
+def layout_paragraphs(frame, x0, x1, max_w, scale):
+    out, total_h = [], 0.0
+    for para in frame.get("paragraphs", []):
+        tokens = tokenize(para.get("runs", []), scale)
+        lines = wrap_lines(tokens, max_w) if tokens else [([], 0.0)]
+        base_size = max([t[2] for t in tokens], default=10.0 * scale)
+        line_h = base_size * ((para.get("lineHeightPct") or 115) / 100.0)
+        out.append((lines, line_h))
+        total_h += line_h * len(lines)
+    return out, total_h
+
 def draw_frame(page, frame):
     import fitz
     x0 = frame["x"] + frame.get("padLeft", 0)
     x1 = frame["x"] + frame["w"] - frame.get("padRight", 0)
     max_w = max(1.0, x1 - x0)
+    avail_h = max(1.0, frame["h"] - frame.get("padTop", 0) - frame.get("padBottom", 0))
+
+    scale = 1.0
+    layout, total_h = layout_paragraphs(frame, x0, x1, max_w, scale)
+    # Publisher's "Shrink text on overflow" autofit: many text boxes (most
+    # visibly single-line headings) shrink their whole font size to keep
+    # content on the lines the box actually has room for, rather than
+    # wrapping to another line and having it clipped. pub2raw doesn't expose
+    # whether autofit is on for a given box, so this approximates it for
+    # every frame that overflows — safe even where Publisher wasn't actually
+    # autofitting, since the alternative (silently dropping the overflow
+    # entirely, as before) is strictly worse.
+    while total_h > avail_h and scale > 0.35:
+        scale -= 0.05
+        layout, total_h = layout_paragraphs(frame, x0, x1, max_w, scale)
+
     y = frame["y"] + frame.get("padTop", 0)
     y_limit = frame["y"] + frame["h"]
-    for para in frame.get("paragraphs", []):
-        tokens = tokenize(para.get("runs", []))
-        lines = wrap_lines(tokens, max_w) if tokens else [([], 0.0)]
-        base_size = max([t[2] for t in tokens], default=10.0)
-        line_h = base_size * ((para.get("lineHeightPct") or 115) / 100.0)
+    for para, (lines, line_h) in zip(frame.get("paragraphs", []), layout):
         for line_tokens, line_w in lines:
             y += line_h
-            if y - line_h > y_limit:
-                return  # frame is full; Publisher would clip here too
+            if y - line_h > y_limit + 0.5:
+                return  # still overflows even at min scale; clip like Publisher would
             align = para.get("align", "left")
             if align == "right":
                 cursor = x1 - line_w
