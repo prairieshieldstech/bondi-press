@@ -961,6 +961,84 @@ import fitz
 PAGE_W, PAGE_H = 612.0, 792.0  # US Letter, points
 THRESHOLD = PAGE_H * 1.4
 
+# A blind fixed-height slice (every exactly 11in) has two real problems on a
+# design with large deliberate whitespace gaps (common in these "long
+# scrolling web page" layouts): it produces entirely blank output pages out
+# of pure gap space, and it chops straight through an image or text block
+# that happens to straddle a boundary. Both are avoidable once slicing knows
+# where the actual content is — so this renders the page at low DPI first to
+# find which vertical bands have real (non-white) pixels, then: cuts at the
+# nearest gap to each target boundary instead of the raw fixed offset
+# (preferring to push a straddling element whole onto the next page over
+# slicing through it), and skips emitting any resulting page whose range
+# has no content in it at all.
+def content_bands(page, scale=0.5, min_gap_pt=24):
+    pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), colorspace=fitz.csGRAY, alpha=False)
+    w, h = pix.width, pix.height
+    samples = pix.samples
+    rows = []
+    for y in range(h):
+        row = samples[y * w:(y + 1) * w]
+        rows.append(any(b < 250 for b in row[::3]))
+    bands, i = [], 0
+    while i < h:
+        if rows[i]:
+            j = i
+            while j < h and rows[j]:
+                j += 1
+            bands.append([i / scale, j / scale])
+            i = j
+        else:
+            i += 1
+    merged = []
+    for b in bands:
+        if merged and b[0] - merged[-1][1] <= min_gap_pt:
+            merged[-1][1] = b[1]
+        else:
+            merged.append(b)
+    return merged
+
+def page_breaks(bands, total_h, band_h_src):
+    # gaps = the blank space BETWEEN content bands (their complement) —
+    # these are the only positions it's ever safe to cut at.
+    gaps, prev_end = [], 0.0
+    for b0, b1 in bands:
+        if b0 > prev_end:
+            gaps.append((prev_end, b0))
+        prev_end = max(prev_end, b1)
+    if prev_end < total_h:
+        gaps.append((prev_end, total_h))
+
+    breaks, y = [0.0], 0.0
+    while y < total_h - 1.0:
+        target = min(y + band_h_src, total_h)
+        if target >= total_h:
+            breaks.append(total_h)
+            break
+        # Search a window around the target (40%-140% of a page height) for
+        # the best gap to cut in, not just whether the target itself lands
+        # in one — a content band that already started on the PREVIOUS
+        # page and is still running through this target needs this: there
+        # is no "start of band" to push forward to on THIS page, but there
+        # may still be a real gap nearby worth reaching for instead of
+        # cutting blind through whatever's still running.
+        lo, hi = y + band_h_src * 0.4, min(y + band_h_src * 1.4, total_h)
+        best_cut, best_dist = None, None
+        for g0, g1 in gaps:
+            cg0, cg1 = max(g0, lo), min(g1, hi)
+            if cg1 <= cg0:
+                continue
+            mid = (cg0 + cg1) / 2.0
+            dist = abs(mid - target)
+            if best_dist is None or dist < best_dist:
+                best_dist, best_cut = dist, mid
+        cut = best_cut if best_cut is not None else target
+        if cut <= y + 1.0:
+            cut = target  # safety: never emit a zero-height page / infinite loop
+        breaks.append(cut)
+        y = cut
+    return breaks
+
 def main():
     path = sys.argv[1]
     src = fitz.open(path)
@@ -975,14 +1053,23 @@ def main():
             continue
         scale = PAGE_W / w
         band_h_src = PAGE_H / scale
-        y = 0.0
-        while y < h - 0.01:
-            band_h = min(band_h_src, h - y)
+        bands = content_bands(page)
+        breaks = page_breaks(bands, h, band_h_src) if bands else None
+        if not breaks:
+            breaks = []
+            y = 0.0
+            while y < h - 0.01:
+                breaks.append(y)
+                y = min(y + band_h_src, h)
+            breaks.append(h)
+        for y0, y1 in zip(breaks, breaks[1:]):
+            if bands and not any(b1 > y0 and b0 < y1 for b0, b1 in bands):
+                continue  # nothing in this range — a pure whitespace gap, drop it
+            band_h = y1 - y0
             out_h = band_h * scale
             new_page = out.new_page(width=PAGE_W, height=out_h)
-            clip = fitz.Rect(0, y, w, y + band_h)
+            clip = fitz.Rect(0, y0, w, y1)
             new_page.show_pdf_page(fitz.Rect(0, 0, PAGE_W, out_h), src, page.number, clip=clip)
-            y += band_h_src
     tmp = path + ".paginated.tmp"
     out.save(tmp, deflate=True, garbage=4)
     out.close()
