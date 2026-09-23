@@ -21,8 +21,8 @@ import (
 )
 
 type App struct {
-	ctx       context.Context
-	logoSVG   []byte
+	ctx        context.Context
+	logoSVG    []byte
 	previewDir string
 	renderDir  string
 
@@ -44,7 +44,7 @@ func (a *App) startup(ctx context.Context) {
 	go func() {
 		if p, err := resolveSoffice(); err == nil {
 			cmd := exec.Command(p, "--headless", "--norestore", "--nologo", "--terminate_after_init")
-	hideConsole(cmd)
+			hideConsole(cmd)
 			cmd.Run()
 		}
 	}()
@@ -487,7 +487,6 @@ def main():
 main()
 `
 
-
 // resolvePub2Raw locates libmspub's pub2raw tool (cached). Unlike pub2xhtml
 // (used only for the PDF-render fallback, see pubToPdfFallback), pub2raw
 // dumps the raw librevenge drawing-interface calls libmspub makes — real
@@ -508,6 +507,13 @@ func resolvePub2Raw() (string, error) {
 // boxes/pictures, instead of pdf2docx's flattened-paragraph reconstruction
 // (see docx-editor.js).
 func (a *App) ExtractPubLayout(pubPath string) (string, error) {
+	return extractPubLayout(pubPath)
+}
+
+// extractPubLayout is the free-function core of ExtractPubLayout, split out
+// so pubToPdfFallback can also call it (real per-frame geometry is exactly
+// what that renderer needs to word-wrap text correctly — see its doc comment).
+func extractPubLayout(pubPath string) (string, error) {
 	pub2raw, err := resolvePub2Raw()
 	if err != nil {
 		return "", err
@@ -571,31 +577,136 @@ func resolveRsvgConvert() (string, error) {
 	return "", toolMissingErr("librsvg (rsvg-convert)", "brew install librsvg")
 }
 
-// pubFallbackScript rasterizes pub2xhtml's per-page SVG into a PDF, for
-// files where soffice's own Publisher import filter fails outright (real
-// case found: a large multi-object "website mockup" .pub that soffice can't
-// even load, while libmspub parses it fine — different import code paths).
+// pubFallbackScript rasterizes pub2xhtml's per-page SVG into a background
+// image (shapes, fills, bitmap-pattern images — everything except text), then
+// draws real, correctly word-wrapped text on top of each page from the
+// layout JSON (see extractPubLayout/extractLayoutScript). Used for files
+// where soffice's own Publisher import filter fails outright (real case
+// found: a large multi-object "website mockup" .pub that soffice can't even
+// load, while libmspub parses it fine — different import code paths).
 //
-// One fixup is required first: pub2xhtml emits font-size as a bare number
-// intended as INCHES (matching how x/y/width/height are also inches-as-bare-
-// numbers over a points-based viewBox), but the SVG spec says an unrooted
-// number is a "user unit" (≈px) — so standard renderers (confirmed on both
-// MuPDF and librsvg) render that text at ~1/72 the intended size, invisibly
-// thin. Multiplying by 72 before handing pages to rsvg-convert fixes this
-// the same way ExtractPubLayout's sizePt conversion already does.
+// Text is rendered separately from the SVG background, rather than left in
+// it, because pub2xhtml's SVG generator emits every paragraph/run of a text
+// frame as bare <svg:tspan> elements with NO x/y/dy positions at all — so an
+// unrelated heading and the body paragraph below it render concatenated onto
+// one baseline with no space or line break between them ("About Us:We are
+// an organization..."), running off the page edge. It carries no frame
+// width either, so there is nothing in the SVG itself to safely wrap
+// against. extractPubLayout (via the OTHER libmspub tool, pub2raw) reads the
+// same underlying document and keeps exactly what's missing here — each
+// frame's real rectangle, and its paragraphs/runs in order — which is what
+// this script uses to lay the text out itself, word-wrapped to the real
+// frame width, before drawing it as real (not rasterized) PDF text.
+//
+// One fixup is required for the background first: pub2xhtml emits font-size
+// as a bare number intended as INCHES (matching how x/y/width/height are
+// also inches-as-bare-numbers over a points-based viewBox), but the SVG spec
+// says an unrooted number is a "user unit" (≈px) — so standard renderers
+// (confirmed on both MuPDF and librsvg) render leftover text at ~1/72 the
+// intended size, invisibly thin. This no longer matters for legibility since
+// text is stripped from the background entirely, but the multiplier is kept
+// so any font-size-dependent layout in the source SVG (rare, but seen in
+// generated markers) stays proportioned correctly.
 const pubFallbackScript = `
-import sys, re, os, subprocess
-import xml.etree.ElementTree as ET
-
-SVG = "http://www.w3.org/2000/svg"
+import sys, re, os, json, subprocess
 
 def fix_font_size(svg_text):
     def repl(m):
         return 'font-size="%.2f"' % (float(m.group(1)) * 72)
     return re.sub(r'font-size="([\d.]+)"', repl, svg_text)
 
+FONT_FAMILIES = {
+    "ti": ("tiro", "tibo", "tiit", "tibi"),   # Times-like
+    "co": ("cour", "cobo", "coit", "cobi"),   # monospace
+    "he": ("helv", "hebo", "heit", "hebi"),   # everything else (Arial/Franklin Gothic/Calibri/...)
+}
+
+def pick_font(family, bold, italic):
+    f = (family or "").lower()
+    if any(k in f for k in ("times", "georgia", "garamond", "cambria", "book antiqua", "palatino", "minion")):
+        base = "ti"
+    elif any(k in f for k in ("courier", "consolas", "mono")):
+        base = "co"
+    else:
+        base = "he"
+    regular, bo, it, bi = FONT_FAMILIES[base]
+    if bold and italic:
+        return bi
+    if bold:
+        return bo
+    if italic:
+        return it
+    return regular
+
+def hex_to_rgb(h):
+    h = (h or "#000000").lstrip("#")
+    if len(h) != 6:
+        return (0.0, 0.0, 0.0)
+    try:
+        return tuple(int(h[i:i+2], 16) / 255.0 for i in (0, 2, 4))
+    except ValueError:
+        return (0.0, 0.0, 0.0)
+
+def tokenize(runs):
+    # (text, font, size, color) per whitespace-or-word chunk, spanning every
+    # run in the paragraph so wrapping can break at any word regardless of
+    # which run (bold/italic/size change) it falls in.
+    out = []
+    for run in runs:
+        font = pick_font(run.get("fontFamily"), run.get("bold"), run.get("italic"))
+        size = run.get("sizePt") or 10.0
+        color = hex_to_rgb(run.get("color"))
+        for tok in re.findall(r"\S+|\s+", run.get("text", "")):
+            out.append((tok, font, size, color))
+    return out
+
+def wrap_lines(tokens, max_w):
+    import fitz
+    lines, cur, cur_w = [], [], 0.0
+    for tok, font, size, color in tokens:
+        w = fitz.get_text_length(tok, fontname=font, fontsize=size)
+        if not tok.strip() and not cur:
+            continue  # never start a line with whitespace
+        if cur and cur_w + w > max_w:
+            lines.append((cur, cur_w))
+            cur, cur_w = ([], 0.0) if not tok.strip() else ([(tok, font, size, color)], w)
+            continue
+        cur.append((tok, font, size, color))
+        cur_w += w
+    if cur:
+        lines.append((cur, cur_w))
+    return lines
+
+def draw_frame(page, frame):
+    import fitz
+    x0 = frame["x"] + frame.get("padLeft", 0)
+    x1 = frame["x"] + frame["w"] - frame.get("padRight", 0)
+    max_w = max(1.0, x1 - x0)
+    y = frame["y"] + frame.get("padTop", 0)
+    y_limit = frame["y"] + frame["h"]
+    for para in frame.get("paragraphs", []):
+        tokens = tokenize(para.get("runs", []))
+        lines = wrap_lines(tokens, max_w) if tokens else [([], 0.0)]
+        base_size = max([t[2] for t in tokens], default=10.0)
+        line_h = base_size * ((para.get("lineHeightPct") or 115) / 100.0)
+        for line_tokens, line_w in lines:
+            y += line_h
+            if y - line_h > y_limit:
+                return  # frame is full; Publisher would clip here too
+            align = para.get("align", "left")
+            if align == "right":
+                cursor = x1 - line_w
+            elif align == "center":
+                cursor = x0 + (max_w - line_w) / 2.0
+            else:  # left, justify (justify approximated as left)
+                cursor = x0
+            for tok, font, size, color in line_tokens:
+                if tok.strip():
+                    page.insert_text((cursor, y), tok, fontname=font, fontsize=size, color=color)
+                cursor += fitz.get_text_length(tok, fontname=font, fontsize=size)
+
 def main():
-    xhtml_path, rsvg, out_pdf = sys.argv[1], sys.argv[2], sys.argv[3]
+    xhtml_path, rsvg, out_pdf, layout_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
     tmp_dir = os.path.dirname(out_pdf)
     with open(xhtml_path, "r", encoding="utf-8", errors="replace") as f:
         raw = f.read()
@@ -608,21 +719,42 @@ def main():
         print("no pages found in pub2xhtml output", file=sys.stderr)
         sys.exit(1)
 
+    layout_pages = []
+    try:
+        with open(layout_path, "r", encoding="utf-8") as f:
+            layout_pages = json.load(f).get("pages", [])
+    except Exception as e:
+        print("layout JSON unavailable, background-only render: %s" % e, file=sys.stderr)
+
     import fitz
     doc = fitz.open()
     for i, chunk in enumerate(page_chunks):
         vb_m = re.search(r'viewBox="0 0 ([\d.]+) ([\d.]+)"', chunk)
         page_w, page_h = (float(vb_m.group(1)), float(vb_m.group(2))) if vb_m else (612.0, 792.0)
-        svg_text = fix_font_size('<?xml version="1.0" encoding="UTF-8"?>\n' + chunk)
+        # Text is dropped from the background: it's drawn for real afterward
+        # from layout_pages (see module docstring above for why).
+        chunk_no_text = re.sub(r"<svg:text[^>]*>.*?</svg:text>", "", chunk, flags=re.S)
+        svg_text = fix_font_size('<?xml version="1.0" encoding="UTF-8"?>\n' + chunk_no_text)
         svg_path = os.path.join(tmp_dir, "page-%d.svg" % i)
         png_path = os.path.join(tmp_dir, "page-%d.png" % i)
         with open(svg_path, "w", encoding="utf-8") as f:
             f.write(svg_text)
-        subprocess.run([rsvg, "-w", str(int(page_w * 2)), "-h", str(int(page_h * 2)),
+        # 3x page points-per-inch (72) = 216 DPI. This path is now the
+        # default renderer for the PDF export and preview, not just a rare
+        # fallback, so it needs to hold up at print/zoom quality, not just
+        # look fine as a thumbnail.
+        subprocess.run([rsvg, "-w", str(int(page_w * 3)), "-h", str(int(page_h * 3)),
                          "-o", png_path, svg_path], check=True,
                         capture_output=True)
         page = doc.new_page(width=page_w, height=page_h)
         page.insert_image(fitz.Rect(0, 0, page_w, page_h), filename=png_path)
+        if i < len(layout_pages):
+            for item in layout_pages[i].get("items", []):
+                if item.get("type") == "text":
+                    try:
+                        draw_frame(page, item)
+                    except Exception as e:
+                        print("text frame render failed (page %d): %s" % (i, e), file=sys.stderr)
     # Without deflate/deflate_images, PyMuPDF re-embeds inserted images
     # uncompressed — a single 390KB page PNG turned into a 31MB PDF page
     # without these flags (confirmed while building this).
@@ -675,9 +807,22 @@ func pubToPdfFallback(pubPath, outPdfPath string) error {
 		return err
 	}
 
+	// Real per-frame geometry (real widths, so text can be word-wrapped
+	// correctly) from the OTHER libmspub tool — see pubFallbackScript's doc
+	// comment for why pub2xhtml's own SVG output can't be used for this. A
+	// failure here isn't fatal: the script falls back to a background-only
+	// render (still strictly better than today's un-wrapped text) rather
+	// than failing the whole conversion over it.
+	layoutPath := filepath.Join(tmpDir, "layout.json")
+	if layoutJSON, layoutErr := extractPubLayout(pubPath); layoutErr == nil {
+		os.WriteFile(layoutPath, []byte(layoutJSON), 0o644)
+	} else {
+		os.WriteFile(layoutPath, []byte(`{"pages":[]}`), 0o644)
+	}
+
 	tmpPdf := filepath.Join(tmpDir, "out.pdf")
 	stderr.Reset()
-	pyCmd := exec.CommandContext(ctx, py, "-c", pubFallbackScript, xhtmlPath, rsvg, tmpPdf)
+	pyCmd := exec.CommandContext(ctx, py, "-c", pubFallbackScript, xhtmlPath, rsvg, tmpPdf, layoutPath)
 	pyCmd.Env = toolEnv()
 	hideConsole(pyCmd)
 	pyCmd.Stderr = &stderr
@@ -688,11 +833,18 @@ func pubToPdfFallback(pubPath, outPdfPath string) error {
 }
 
 // pubToPdf converts pubPath to a PDF in outDir, trying soffice first (the
-// common case: fast, and matches what the "draw" chain does for every other
-// format) and falling back to the libmspub+librsvg path (pubToPdfFallback)
-// if soffice's own Publisher import filter fails to even load the file —
+// common case: fast, and produces a real text layer that the pdf2docx chain
+// needs) and falling back to the libmspub+librsvg path (pubToPdfFallback) if
+// soffice's own Publisher import filter fails to even load the file —
 // confirmed to happen on legitimate, non-corrupt .pub files that are just
-// unusually complex (many small objects), which libmspub parses fine.
+// unusually complex (many small objects, e.g. website-mockup-style layouts),
+// which libmspub parses fine.
+//
+// NOTE: pubToPdfFallback's renderer does not word-wrap text to its frame's
+// width (see pubFallbackScript) — every .pub file that reaches it renders
+// with paragraphs run onto a single overflowing line. Do not prefer this
+// path over soffice for files soffice can actually load; it is a
+// last-resort fallback, not a higher-fidelity alternative, until that's fixed.
 func pubToPdf(pubPath, outDir string) (string, error) {
 	base := strings.TrimSuffix(filepath.Base(pubPath), filepath.Ext(pubPath))
 	outPath := expectedOut(outDir, base, "pdf")
@@ -727,22 +879,22 @@ func copyDir(src, dst string) error {
 var formats = []string{"pdf", "docx", "doc", "odt", "rtf", "txt", "png", "jpg", "svg", "html", "odg"}
 
 type formatSpec struct {
-	ext  string
+	ext   string
 	chain string // "draw" = single soffice call; "pdf2docx" = pub→pdf→docx→target
 }
 
 var formatMap = map[string]formatSpec{
-	"pdf":  {ext: "pdf",  chain: "draw"},
-	"png":  {ext: "png",  chain: "draw"},
-	"jpg":  {ext: "jpg",  chain: "draw"},
-	"svg":  {ext: "svg",  chain: "draw"},
+	"pdf":  {ext: "pdf", chain: "draw"},
+	"png":  {ext: "png", chain: "draw"},
+	"jpg":  {ext: "jpg", chain: "draw"},
+	"svg":  {ext: "svg", chain: "draw"},
 	"html": {ext: "html", chain: "draw"},
-	"odg":  {ext: "odg",  chain: "draw"},
+	"odg":  {ext: "odg", chain: "draw"},
 	"docx": {ext: "docx", chain: "pdf2docx"},
-	"doc":  {ext: "doc",  chain: "pdf2docx"},
-	"odt":  {ext: "odt",  chain: "pdf2docx"},
-	"rtf":  {ext: "rtf",  chain: "pdf2docx"},
-	"txt":  {ext: "txt",  chain: "pdf2docx"},
+	"doc":  {ext: "doc", chain: "pdf2docx"},
+	"odt":  {ext: "odt", chain: "pdf2docx"},
+	"rtf":  {ext: "rtf", chain: "pdf2docx"},
+	"txt":  {ext: "txt", chain: "pdf2docx"},
 }
 
 func (a *App) Formats() []string { return formats }
@@ -1172,7 +1324,7 @@ func moveOrRename(src, dst string) error {
 func (a *App) CheckStatus() map[string]bool {
 	ok, _ := a.CheckSoffice()
 	return map[string]bool{
-		"soffice":   ok,
+		"soffice":  ok,
 		"pdf2docx": a.CheckPdf2docx(),
 		"tools":    goruntime.GOOS != "windows" || toolsInstalled(),
 	}
